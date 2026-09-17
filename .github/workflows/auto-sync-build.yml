@@ -14,6 +14,11 @@ on:
         description: 'Upstream ref to sync (tag/branch). Default = latest upstream tag.'
         required: false
         default: ''
+      force:
+        description: 'Build even when main already contains the upstream ref'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -42,34 +47,44 @@ jobs:
       - name: Fetch upstream
         run: |
           git remote add upstream "${{ vars.UPSTREAM_REPO || 'https://github.com/NanmiCoder/cc-haha' }}" || true
-          git fetch upstream --tags --prune --no-write-fetch-head
+          git fetch upstream --tags
 
       - name: Resolve target ref
         id: target
         run: |
-          input="${{ github.event.inputs.ref }}"
+          input='${{ github.event.inputs.ref }}'
           if [ -n "$input" ]; then
             ref="$input"
           else
             ref="$(git ls-remote --tags --refs upstream | awk -F/ '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
           fi
           [ -n "$ref" ] || { echo "::error::no upstream ref resolved"; exit 1; }
+          # tags land in refs/tags/<name>, branches in refs/remotes/upstream/<name>
+          sha="$(git rev-parse "$ref^{commit}" 2>/dev/null || git rev-parse "upstream/$ref^{commit}")" || {
+            echo "::error::cannot resolve '$ref' as tag or upstream branch"; exit 1; }
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "target: $ref -> $(git rev-parse --short "upstream/$ref^{commit}")"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "target: $ref -> $sha"
 
       - name: Merge upstream into main
         id: merge
         run: |
           ref='${{ steps.target.outputs.ref }}'
-          sha="$(git rev-parse "upstream/$ref^{commit}")"
-          git checkout -B main "origin/main" 2>/dev/null || git checkout -B main
-          git reset --hard origin/main 2>/dev/null || true
+          sha='${{ steps.target.outputs.sha }}'
+          git checkout -B main
+          git reset --hard origin/main
           if git merge-base --is-ancestor "$sha" HEAD; then
             echo "already up to date with $ref ($sha)"
-            echo "updated=false" >> "$GITHUB_OUTPUT"
+            if [ '${{ github.event.inputs.force }}' = 'true' ]; then
+              echo "force=true -> rebuild anyway"
+              echo "updated=true" >> "$GITHUB_OUTPUT"
+              echo "upstream_ref=$ref" >> "$GITHUB_OUTPUT"
+            else
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
-          if git merge --no-edit -X no-renames "upstream/$ref"; then
+          if git merge --no-edit "$sha"; then
             echo "updated=true" >> "$GITHUB_OUTPUT"
             echo "upstream_ref=$ref" >> "$GITHUB_OUTPUT"
             git log --oneline -1
