@@ -136,7 +136,13 @@ jobs:
 
       - name: Build sidecars
         working-directory: desktop
-        run: bun run build:sidecars
+        env:
+          SIDECAR_TARGET_TRIPLE: x86_64-pc-windows-msvc
+          BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
+        # bun build --compile downloads the bun-windows-x64-baseline runtime;
+        # that download occasionally comes back truncated -> retry once.
+        run: |
+          bun run build:sidecars || { echo '::warning::build:sidecars failed, retrying'; bun run build:sidecars; }
 
       - name: Build renderer and Electron bundles
         working-directory: desktop
