@@ -1,0 +1,161 @@
+name: Auto Sync Upstream & Build
+
+# Pulls the latest upstream tag into main; if the merge is clean it pushes and
+# builds a Windows installer online (uploaded as an artifact + a pre-release).
+# On merge conflicts it reports the conflicted files, aborts the merge, and
+# leaves main untouched for manual resolution.
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # daily 09:00 Beijing time
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream ref to sync (tag/branch). Default = latest upstream tag.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-sync-build
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.merge.outputs.updated }}
+      upstream_ref: ${{ steps.merge.outputs.upstream_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "${{ vars.UPSTREAM_REPO || 'https://github.com/NanmiCoder/cc-haha' }}" || true
+          git fetch upstream --tags --prune --no-write-fetch-head
+
+      - name: Resolve target ref
+        id: target
+        run: |
+          input="${{ github.event.inputs.ref }}"
+          if [ -n "$input" ]; then
+            ref="$input"
+          else
+            ref="$(git ls-remote --tags --refs upstream | awk -F/ '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          fi
+          [ -n "$ref" ] || { echo "::error::no upstream ref resolved"; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "target: $ref -> $(git rev-parse --short "upstream/$ref^{commit}")"
+
+      - name: Merge upstream into main
+        id: merge
+        run: |
+          ref='${{ steps.target.outputs.ref }}'
+          sha="$(git rev-parse "upstream/$ref^{commit}")"
+          git checkout -B main "origin/main" 2>/dev/null || git checkout -B main
+          git reset --hard origin/main 2>/dev/null || true
+          if git merge-base --is-ancestor "$sha" HEAD; then
+            echo "already up to date with $ref ($sha)"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git merge --no-edit -X no-renames "upstream/$ref"; then
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_ref=$ref" >> "$GITHUB_OUTPUT"
+            git log --oneline -1
+            git push origin HEAD:main
+          else
+            echo "::error::merge conflicts with $ref -- main left untouched, resolve manually"
+            echo 'conflicted files:'
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.updated == 'true'
+    runs-on: windows-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install root dependencies
+        run: bun install
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: bun install
+
+      - name: Install adapter dependencies
+        working-directory: adapters
+        run: bun install
+
+      - name: Prepare bundled ripgrep
+        working-directory: desktop
+        run: bun run prepare:ripgrep
+
+      - name: Build sidecars
+        working-directory: desktop
+        run: bun run build:sidecars
+
+      - name: Build renderer and Electron bundles
+        working-directory: desktop
+        run: |
+          bun run build
+          bun run build:electron
+
+      - name: Package Windows installer (unsigned)
+        working-directory: desktop
+        run: node ./node_modules/electron-builder/out/cli/cli.js --win nsis --x64 --publish never
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "value=$(node -p "require('./desktop/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Code-Haha-${{ steps.version.outputs.value }}-win-x64
+          path: |
+            desktop/build-artifacts/electron/*.exe
+            desktop/build-artifacts/electron/*.blockmap
+            desktop/build-artifacts/electron/latest.yml
+          if-no-files-found: error
+
+      - name: Publish draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: auto-${{ needs.sync.outputs.upstream_ref }}-${{ github.run_number }}
+          name: 'Auto build ${{ needs.sync.outputs.upstream_ref }}'
+          body: 'Auto-synced from upstream ${{ needs.sync.outputs.upstream_ref }}. Unsigned dev build -- for internal testing only.'
+          draft: true
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: |
+            desktop/build-artifacts/electron/*.exe
+            desktop/build-artifacts/electron/*.blockmap
+            desktop/build-artifacts/electron/latest.yml
