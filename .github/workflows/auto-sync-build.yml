@@ -130,6 +130,8 @@ jobs:
 
       - name: Prepare bundled ripgrep
         working-directory: desktop
+        env:
+          SIDECAR_TARGET_TRIPLE: x86_64-pc-windows-msvc
         run: bun run prepare:ripgrep
 
       - name: Build sidecars
