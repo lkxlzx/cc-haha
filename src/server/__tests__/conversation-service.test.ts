@@ -1156,6 +1156,87 @@ describe('ConversationService', () => {
     expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
   })
 
+  test('buildChildEnv points ANTHROPIC_MODEL at a selected catalog model', async () => {
+    const providerService = new ProviderService()
+    const provider = await providerService.addProvider({
+      presetId: 'custom',
+      name: 'Catalog Switchable',
+      apiKey: 'provider-key',
+      baseUrl: 'https://api.catalog.example',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'catalog-fallback-main',
+        haiku: 'catalog-fallback-main',
+        sonnet: 'catalog-fallback-main',
+        opus: 'catalog-fallback-main',
+      },
+      modelCatalog: [{ id: 'catalog-model', enabled: true }],
+    })
+
+    const service = new ConversationService() as any
+    const env = (await service.buildChildEnv('/tmp', undefined, {
+      providerId: provider.id,
+      model: 'catalog-model',
+    })) as Record<string, string>
+
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://api.catalog.example')
+    expect(env.ANTHROPIC_MODEL).toBe('catalog-model')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('catalog-fallback-main')
+    expect(env.CC_HAHA_EXACT_RUNTIME_MODEL_ID).toBe('catalog-model')
+  })
+
+  test('buildChildEnv does not mark fixed provider slots as exact catalog models', async () => {
+    const providerService = new ProviderService()
+    const provider = await providerService.addProvider({
+      presetId: 'custom',
+      name: 'Role Switchable',
+      apiKey: 'provider-key',
+      baseUrl: 'https://api.roles.example',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'role-main',
+        haiku: 'role-haiku',
+        sonnet: 'role-sonnet',
+        opus: 'role-opus',
+      },
+    })
+
+    const service = new ConversationService() as any
+    const env = (await service.buildChildEnv('/tmp', undefined, {
+      providerId: provider.id,
+      model: 'sonnet',
+    })) as Record<string, string>
+
+    expect(env.CC_HAHA_EXACT_RUNTIME_MODEL_ID).toBeUndefined()
+  })
+
+  test('buildChildEnv marks a catalog model that collides with a role alias as exact', async () => {
+    const providerService = new ProviderService()
+    const provider = await providerService.addProvider({
+      presetId: 'custom',
+      name: 'Alias Catalog Provider',
+      apiKey: 'provider-key',
+      baseUrl: 'https://api.alias-catalog.example',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'role-main',
+        haiku: 'role-haiku',
+        sonnet: 'role-sonnet',
+        opus: 'role-opus',
+      },
+      modelCatalog: [{ id: 'sonnet', enabled: true }],
+    })
+
+    const service = new ConversationService() as any
+    const env = (await service.buildChildEnv('/tmp', undefined, {
+      providerId: provider.id,
+      model: 'sonnet',
+    })) as Record<string, string>
+
+    expect(env.ANTHROPIC_MODEL).toBe('sonnet')
+    expect(env.CC_HAHA_EXACT_RUNTIME_MODEL_ID).toBe('sonnet')
+  })
+
   test('buildChildEnv clears stale api key for bearer-token providers', async () => {
     const providerService = new ProviderService()
     const provider = await providerService.addProvider({
@@ -1493,6 +1574,22 @@ describe('ConversationService', () => {
     expect(args).toContain('model-b-opus')
     expect(args).toContain('--effort')
     expect(args).toContain('max')
+  })
+
+  test('buildSessionCliArgs keeps a selected catalog runtime model as the exact CLI pointer', () => {
+    const service = new ConversationService() as any
+    const args = service.buildSessionCliArgs(
+      '123e4567-e89b-12d3-a456-426614174000',
+      'ws://127.0.0.1:3456/sdk/test-session?token=test-token',
+      false,
+      {
+        model: 'catalog-model[1m]',
+      },
+    ) as string[]
+
+    expect(args).toContain('--model')
+    expect(args).toContain('catalog-model[1m]')
+    expect(args).not.toContain('main-model')
   })
 
   test('buildSessionCliArgs starts pending desktop worktrees through the native CLI flag', () => {

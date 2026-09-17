@@ -6,7 +6,7 @@ import { ApiError } from '../../api/client'
 import { getDesktopHost } from '../../lib/desktopHost'
 import { useProviderStore } from '../../stores/providerStore'
 import { useSettingsStore } from '../../stores/settingsStore'
-import type { SavedProvider } from '../../types/provider'
+import type { CreateProviderInput, SavedProvider } from '../../types/provider'
 import { ProviderSettings } from './ProviderSettings'
 
 vi.mock('../../components/settings/ClaudeOfficialLogin', () => ({ ClaudeOfficialLogin: () => null }))
@@ -27,6 +27,18 @@ const savedProviders: SavedProvider[] = ([
   models: { main: model, haiku: model, sonnet: model, opus: model },
 }))
 
+function savedProviderFromCreateInput(input: CreateProviderInput, id: string): SavedProvider {
+  return {
+    ...input,
+    id,
+    apiFormat: input.apiFormat ?? 'anthropic',
+    apiKeys: input.apiKeys?.map((key, index) => ({
+      ...key,
+      id: key.id ?? `created-key-${index + 1}`,
+    })),
+  }
+}
+
 describe('ApiSmart sponsor provider', () => {
   beforeEach(() => {
     useSettingsStore.setState({ locale: 'en' })
@@ -44,7 +56,7 @@ describe('ApiSmart sponsor provider', () => {
   it('prefills the sponsor connection, opens its landing page, and saves the selected models', async () => {
     const open = vi.spyOn(getDesktopHost().shell, 'open').mockResolvedValue()
     const create = vi.spyOn(providersApi, 'create').mockImplementation(async (input) => ({
-      provider: { ...input, id: 'saved-apismart', apiFormat: input.apiFormat ?? 'anthropic' },
+      provider: savedProviderFromCreateInput(input, 'saved-apismart'),
     }))
     render(<ProviderSettings />)
     fireEvent.click(await screen.findByRole('button', { name: /Add Model/ }))
@@ -123,7 +135,11 @@ describe('retired sponsor providers', () => {
   })
 
   it('explains why a remote endpoint change needs an explicit key and allows retry', async () => {
-    const provider = { ...savedProviders[0]!, apiKey: '' }
+    const provider = {
+      ...savedProviders[0]!,
+      apiKey: '',
+      apiKeys: [{ id: 'primary', apiKey: '', enabled: true, weight: 1 }],
+    }
     vi.mocked(providersApi.list).mockResolvedValue({ providers: [provider], activeId: null })
     const update = vi.spyOn(providersApi, 'update')
       .mockRejectedValueOnce(new ApiError(400, { code: 'REMOTE_PROVIDER_CREDENTIAL_REQUIRED' }))
@@ -135,9 +151,12 @@ describe('retired sponsor providers', () => {
     fireEvent.click(dialog.getByRole('button', { name: 'Save' }))
     expect(await dialog.findByRole('alert')).toHaveTextContent('enter the model or image API key again')
     expect(screen.getByRole('dialog')).toBeInTheDocument()
-    fireEvent.change(dialog.getAllByPlaceholderText('sk-...')[0]!, { target: { value: 'fake-explicit-new-key' } })
+    fireEvent.change(dialog.getByLabelText('API Key'), { target: { value: 'fake-explicit-new-key' } })
     fireEvent.click(dialog.getByRole('button', { name: 'Save' }))
-    await waitFor(() => expect(update).toHaveBeenLastCalledWith(provider.id, expect.objectContaining({ apiKey: 'fake-explicit-new-key', baseUrl: 'https://replacement.invalid' })))
+    await waitFor(() => expect(update).toHaveBeenLastCalledWith(provider.id, expect.objectContaining({
+      apiKeys: [expect.objectContaining({ id: 'primary', apiKey: 'fake-explicit-new-key' })],
+      baseUrl: 'https://replacement.invalid',
+    })))
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
   })
 
@@ -180,7 +199,13 @@ describe('retired sponsor providers', () => {
     await waitFor(() => expect(update).toHaveBeenCalledWith(provider.id, expect.objectContaining({
       name: `${provider.name} edited`,
       baseUrl: provider.baseUrl,
-      apiKey: provider.apiKey,
+      apiKeys: [{
+        id: 'primary',
+        apiKey: provider.apiKey,
+        proxyUrl: '',
+        enabled: true,
+        weight: 1,
+      }],
       apiFormat: provider.apiFormat,
       authStrategy: 'auth_token',
       models: provider.models,
@@ -190,6 +215,118 @@ describe('retired sponsor providers', () => {
     expect(useProviderStore.getState().providers.find((saved) => saved.id === provider.id))
       .toMatchObject({ ...provider, name: `${provider.name} edited` })
     expect(screen.getByTestId(`provider-${provider.id}`)).toHaveTextContent(`${provider.name} edited`)
+  })
+})
+
+describe('provider model catalog settings', () => {
+  const provider = {
+    ...savedProviders[0]!,
+    id: 'catalog-provider',
+    modelCatalog: [{
+      id: 'catalog-model',
+      name: 'Catalog Model',
+      contextWindow: 200000,
+      supports1m: false,
+      enabled: true,
+    }],
+  }
+
+  beforeEach(() => {
+    useSettingsStore.setState({ locale: 'en' })
+    vi.spyOn(useSettingsStore.getState(), 'fetchAll').mockResolvedValue()
+    vi.spyOn(providersApi, 'list').mockResolvedValue({ providers: [provider], activeId: null })
+    vi.spyOn(providersApi, 'getSettings').mockResolvedValue({})
+    vi.spyOn(providersApi, 'updateSettings').mockResolvedValue({ ok: true })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('loads, edits, and saves enabled catalog models with their exact runtime capabilities', async () => {
+    const update = vi.spyOn(providersApi, 'update').mockImplementation(async (_id, input) => {
+      const updated = { ...provider, ...input } as SavedProvider
+      vi.mocked(providersApi.list).mockResolvedValue({ providers: [updated], activeId: null })
+      return { provider: updated }
+    })
+
+    render(<ProviderSettings />)
+    const card = await screen.findByTestId(`provider-${provider.id}`)
+    fireEvent.click(within(card).getByRole('button', { name: 'Edit' }))
+    const dialog = within(screen.getByRole('dialog'))
+
+    expect(dialog.getByText('catalog-model')).toBeInTheDocument()
+    fireEvent.click(dialog.getByRole('button', { name: 'Expand model settings' }))
+    fireEvent.change(dialog.getByRole('textbox', { name: 'Context window' }), {
+      target: { value: '128000' },
+    })
+    fireEvent.click(dialog.getByRole('checkbox', { name: /Supports 1M context/ }))
+    fireEvent.click(dialog.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(update).toHaveBeenCalledWith(provider.id, expect.objectContaining({
+      modelCatalog: [{
+        id: 'catalog-model',
+        name: 'Catalog Model',
+        contextWindow: 128000,
+        supports1m: true,
+        enabled: true,
+      }],
+    })))
+  })
+
+  it('clears the persisted catalog when its last model is removed', async () => {
+    const update = vi.spyOn(providersApi, 'update').mockImplementation(async (_id, input) => {
+      const updated = { ...provider, ...input } as SavedProvider
+      vi.mocked(providersApi.list).mockResolvedValue({ providers: [updated], activeId: null })
+      return { provider: updated }
+    })
+
+    render(<ProviderSettings />)
+    const card = await screen.findByTestId(`provider-${provider.id}`)
+    fireEvent.click(within(card).getByRole('button', { name: 'Edit' }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByRole('button', { name: 'Remove model' }))
+    fireEvent.click(dialog.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(update).toHaveBeenCalledWith(
+      provider.id,
+      expect.objectContaining({ modelCatalog: null }),
+    ))
+  })
+
+  it('sends catalog models added while creating a provider', async () => {
+    vi.mocked(providersApi.list).mockResolvedValue({ providers: [], activeId: null })
+    const create = vi.spyOn(providersApi, 'create').mockImplementation(async (input) => ({
+      provider: savedProviderFromCreateInput(input, 'created-catalog-provider'),
+    }))
+
+    render(<ProviderSettings />)
+    fireEvent.click(await screen.findByRole('button', { name: /Add Model/ }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByRole('button', { name: 'Custom' }))
+    fireEvent.change(dialog.getByRole('textbox', { name: /Base URL/ }), {
+      target: { value: 'https://catalog.invalid' },
+    })
+    fireEvent.change(dialog.getByLabelText('API Key'), {
+      target: { value: 'fake-catalog-key' },
+    })
+    fireEvent.change(dialog.getByRole('textbox', { name: /Main Model/ }), {
+      target: { value: 'created-main-model' },
+    })
+    fireEvent.click(dialog.getByRole('button', { name: /Add model/ }))
+    const addButtons = dialog.getAllByRole('button', { name: 'Add' })
+    fireEvent.change(dialog.getByLabelText('Model ID'), {
+      target: { value: 'created-catalog-model' },
+    })
+    fireEvent.click(addButtons[0]!)
+    const submit = dialog.getAllByRole('button', { name: 'Add' }).at(-1)!
+    expect(submit).toBeEnabled()
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      modelCatalog: [{ id: 'created-catalog-model', enabled: true }],
+    })))
   })
 })
 

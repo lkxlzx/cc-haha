@@ -71,6 +71,21 @@ describe('ModelSelector', () => {
     expect(button.querySelector('span')).toHaveClass('truncate')
   })
 
+  it('anchors the opened dropdown on the currently selected model', async () => {
+    const scrollIntoView = vi.fn()
+    Element.prototype.scrollIntoView = scrollIntoView
+    useSettingsStore.setState({ locale: 'en', availableModels: MODELS, currentModel: MODELS[1] })
+    render(<ModelSelector value="beta" onChange={vi.fn()} />)
+    expect(scrollIntoView).not.toHaveBeenCalled()
+
+    // The trigger button carries the selected model name; clicking it opens
+    // the panel, which must immediately scroll the selected option into view.
+    await clickByRole(/^Beta/)
+    const dropdown = screen.getByTestId('model-selector-dropdown')
+    expect(within(dropdown).getByRole('button', { name: /^Beta/ })).toBeInTheDocument()
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' })
+  })
+
   it.each([true, false])('sends each provider slot with 1M=%s and preserves reasoning controls', async (enabled) => {
     useSettingsStore.setState({ locale: 'en', effortLevel: 'high' })
     useProviderStore.setState({
@@ -92,6 +107,52 @@ describe('ModelSelector', () => {
       })
       expect(screen.getByRole('button', { name: /High/ })).toBeInTheDocument()
     }
+  })
+
+  it('lists enabled catalog models and keeps the selected model id as the runtime pointer', async () => {
+    useSettingsStore.setState({ locale: 'en', effortLevel: 'high' })
+    useProviderStore.setState({
+      activeId: 'provider-catalog',
+      hasLoadedProviders: true,
+      isLoading: false,
+      providers: [{
+        id: 'provider-catalog',
+        presetId: 'custom',
+        name: 'Provider Catalog',
+        apiFormat: 'anthropic',
+        apiKey: 'fixture',
+        baseUrl: 'http://127.0.0.1:9999',
+        models: {
+          main: 'main-model',
+          haiku: 'fast-model',
+          sonnet: 'balanced-model',
+          opus: 'large-model',
+        },
+        modelCatalog: [
+          { id: 'catalog-model', enabled: true },
+          { id: 'long-model', supports1m: true, enabled: true },
+          { id: 'retired-model', enabled: false },
+        ],
+      }],
+    })
+    const runtimeChange = vi.fn()
+    render(<ModelSelector runtimeKey="__draft__" onRuntimeSelectionChange={runtimeChange} />)
+
+    await clickByRole(/main-model, Provider Catalog/)
+    const dropdown = screen.getByTestId('model-selector-dropdown')
+    expect(within(dropdown).getByRole('button', { name: /^catalog-model/ })).toBeInTheDocument()
+    expect(within(dropdown).getByRole('button', { name: /^long-model\[1m\]/ })).toBeInTheDocument()
+    expect(within(dropdown).queryByRole('button', { name: /retired-model/ })).not.toBeInTheDocument()
+
+    fireEvent.click(within(dropdown).getByRole('button', { name: /^catalog-model/ }))
+    // Catalog models carry no reasoning-effort metadata, so the selection
+    // carries the session's current effort through (same contract every
+    // provider model follows — see the "preserves reasoning controls" case).
+    expect(runtimeChange).toHaveBeenLastCalledWith({
+      providerId: 'provider-catalog',
+      modelId: 'catalog-model',
+      effortLevel: 'high',
+    })
   })
 
   it.each(['unknown', 'mixed', 'anthropic'] as const)(

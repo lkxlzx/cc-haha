@@ -17,11 +17,44 @@ import {
   type ModelReasoningApiFormat,
   type ModelReasoningProviderKind,
 } from '../../../src/shared/modelReasoning'
+import type { ProviderCatalogModel } from '../types/provider'
 
 const PROVIDER_MODEL_SLOTS = ['main', 'haiku', 'sonnet', 'opus', 'fable'] as const
 
-function baseProviderModelId(modelId: string): string {
+export function baseProviderModelId(modelId: string): string {
   return modelId.trim().replace(/\[1m\]$/i, '').replace(/:1m$/i, '').trim()
+}
+
+export function getEnabledProviderCatalogModels(
+  provider: SavedProvider,
+): ProviderCatalogModel[] {
+  const seen = new Set<string>()
+  const models: ProviderCatalogModel[] = []
+  for (const model of provider.modelCatalog ?? []) {
+    const id = model.id.trim()
+    if (!id || model.enabled === false) continue
+    const key = baseProviderModelId(id)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    models.push({
+      ...model,
+      id,
+      ...(model.name?.trim() ? { name: model.name.trim() } : {}),
+    })
+  }
+  return models
+}
+
+export function resolveProviderCatalogModelRuntimeId(
+  model: ProviderCatalogModel,
+  requestedModelId = model.id,
+): string {
+  const baseId = baseProviderModelId(model.id)
+  const requested = requestedModelId.trim()
+  if (!baseId || baseProviderModelId(requested) !== baseId) return requested
+  if (model.supports1m === true) return `${baseId}[1m]`
+  if (model.supports1m === false) return baseId
+  return requested
 }
 
 export function resolveProviderSlotModelId(
@@ -37,13 +70,38 @@ export function resolveProviderSlotModelId(
 }
 
 export function resolveProviderRuntimeModelId(provider: SavedProvider, modelId: string): string {
+  const requested = modelId.trim()
+  if (!requested) return ''
+
+  const catalogModel = getEnabledProviderCatalogModels(provider).find(
+    (model) => baseProviderModelId(model.id) === baseProviderModelId(requested),
+  )
+  if (catalogModel?.supports1m !== undefined) {
+    return resolveProviderCatalogModelRuntimeId(catalogModel, requested)
+  }
+
   const candidates = PROVIDER_MODEL_SLOTS
     .filter((slot) => provider.models[slot]?.trim() &&
       baseProviderModelId(provider.models[slot]!) === baseProviderModelId(modelId))
     .map((slot) => resolveProviderSlotModelId(provider, slot))
   // A provider can map one ID to slots with different capabilities. Preserve
   // an exact runtime choice; otherwise reconcile old IDs in main-first order.
-  return candidates.find((candidate) => candidate === modelId.trim()) ?? candidates[0] ?? modelId
+  const slotMatch = candidates.find((candidate) => candidate === requested) ?? candidates[0]
+  if (slotMatch) return slotMatch
+  if (catalogModel) return resolveProviderCatalogModelRuntimeId(catalogModel, requested)
+  return requested
+}
+
+export function getProviderRuntimeModelIds(provider: SavedProvider): Set<string> {
+  const modelIds = new Set(
+    PROVIDER_MODEL_SLOTS
+      .filter((slot) => provider.models[slot]?.trim())
+      .map((slot) => resolveProviderSlotModelId(provider, slot)),
+  )
+  for (const model of getEnabledProviderCatalogModels(provider)) {
+    modelIds.add(resolveProviderCatalogModelRuntimeId(model))
+  }
+  return modelIds
 }
 
 export function resolveActiveProviderRuntimeSelection(

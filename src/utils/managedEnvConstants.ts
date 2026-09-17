@@ -12,6 +12,7 @@
  * config vars (endpoint, project, region, auth) do.
  */
 export const PROVIDER_MAX_OUTPUT_TOKENS_ENV_KEY = 'CLAUDE_CODE_PROVIDER_MAX_OUTPUT_TOKENS'
+export const EXACT_RUNTIME_MODEL_ENV_KEY = 'CC_HAHA_EXACT_RUNTIME_MODEL_ID'
 
 const PROVIDER_MANAGED_ENV_VARS = new Set([
   // The flag itself — settings can't unset it once the host set it
@@ -78,6 +79,7 @@ const PROVIDER_MANAGED_ENV_VARS = new Set([
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
   'CLAUDE_CODE_ATTRIBUTION_HEADER',
   'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
+  EXACT_RUNTIME_MODEL_ENV_KEY,
   PROVIDER_MAX_OUTPUT_TOKENS_ENV_KEY,
 ])
 

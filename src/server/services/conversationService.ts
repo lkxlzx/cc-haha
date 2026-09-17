@@ -31,6 +31,7 @@ import {
   IMAGE_GENERATION_PROVIDER_ID_ENV_KEY,
   IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
 } from '../../services/imageGeneration/config.js'
+import { EXACT_RUNTIME_MODEL_ENV_KEY } from '../../utils/managedEnvConstants.js'
 import { sessionService } from './sessionService.js'
 import { diagnosticsService } from './diagnosticsService.js'
 import {
@@ -56,6 +57,7 @@ import { findCanonicalGitRoot } from '../../utils/git.js'
 import { sanitizePath } from '../../utils/path.js'
 import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
 import { attributionHeaderEnvForModel } from './attributionHeaderPolicy.js'
+import { isEnabledProviderCatalogModel } from './providerRuntimeEnv.js'
 import {
   buildNetworkEnvironment,
   loadNetworkSettings,
@@ -1590,6 +1592,7 @@ export class ConversationService {
     ] as const
 
     const cleanEnv = await getProcessEnvWithTerminalShellEnvironment()
+    delete cleanEnv[EXACT_RUNTIME_MODEL_ENV_KEY]
     if (networkRuntimeMetadata) {
       networkRuntimeMetadata.firstTokenTimeoutDerived =
         !cleanEnv.CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS
@@ -1626,6 +1629,12 @@ export class ConversationService {
     const explicitProviderEnv = explicitProvider
       ? await this.providerService.getProviderRuntimeEnv(explicitProvider.id)
       : null
+    const exactCatalogModelId =
+      explicitProvider &&
+      options?.model?.trim() &&
+      isEnabledProviderCatalogModel(explicitProvider, options.model)
+        ? options.model.trim()
+        : undefined
     const networkEnv = buildNetworkEnvironment(
       networkSettingsOverride ?? await loadNetworkSettings(),
       cleanEnv,
@@ -1758,6 +1767,9 @@ export class ConversationService {
       // 否则 CLI 会忽略 provider 的 AUTH_TOKEN、错误地走 OAuth 打到第三方
       // endpoint。详见 src/utils/auth.ts isManagedOAuthContext()。
       ...(explicitProviderEnv ?? {}),
+      ...(exactCatalogModelId
+        ? { [EXACT_RUNTIME_MODEL_ENV_KEY]: exactCatalogModelId }
+        : {}),
       ...(
         isOpenAIOfficialProviderId(options?.providerId) &&
         isOpenAIReasoningEffort(options?.effort)

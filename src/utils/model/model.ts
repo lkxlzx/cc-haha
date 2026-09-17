@@ -24,6 +24,7 @@ import { isEnvTruthy } from '../envUtils.js'
 import { getModelStrings, resolveOverriddenModel } from './modelStrings.js'
 import { formatModelPricing, getOpus46CostTier } from '../modelCost.js'
 import { getSettings_DEPRECATED } from '../settings/settings.js'
+import { EXACT_RUNTIME_MODEL_ENV_KEY } from '../managedEnvConstants.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import {
   getAPIProvider,
@@ -41,6 +42,22 @@ import { capitalize } from '../stringUtils.js'
 export type ModelShortName = string
 export type ModelName = string
 export type ModelSetting = ModelName | ModelAlias | null
+
+function getExactRuntimeModelId(): string | undefined {
+  const exactModelId = process.env[EXACT_RUNTIME_MODEL_ENV_KEY]?.trim()
+  return exactModelId || undefined
+}
+
+function isExactRuntimeModelSelection(
+  model: ModelName | ModelAlias | null | undefined,
+): boolean {
+  const exactModelId = getExactRuntimeModelId()
+  return (
+    !!exactModelId &&
+    !!model &&
+    model.trim().toLowerCase() === exactModelId.toLowerCase()
+  )
+}
 
 export function getSmallFastModel(): ModelName {
   return process.env.ANTHROPIC_SMALL_FAST_MODEL || getDefaultHaikuModel()
@@ -80,7 +97,13 @@ export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
   }
 
   // Ignore the user-specified model if it's not in the availableModels allowlist.
-  if (specifiedModel && !isModelAllowed(specifiedModel)) {
+  // A model selected from the desktop provider catalog is already an explicit
+  // host-side pointer, so aliases in that list must not rewrite or reject it.
+  if (
+    specifiedModel &&
+    !isExactRuntimeModelSelection(specifiedModel) &&
+    !isModelAllowed(specifiedModel)
+  ) {
     return undefined
   }
 
@@ -184,6 +207,10 @@ export function getRuntimeMainLoopModel(params: {
   exceeds200kTokens?: boolean
 }): ModelName {
   const { permissionMode, mainLoopModel, exceeds200kTokens = false } = params
+
+  if (isExactRuntimeModelSelection(mainLoopModel)) {
+    return mainLoopModel
+  }
 
   // opusplan uses Opus in plan mode without [1m] suffix.
   if (
@@ -533,6 +560,11 @@ export function parseUserSpecifiedModel(
   modelInput: ModelName | ModelAlias,
 ): ModelName {
   const modelInputTrimmed = modelInput.trim()
+
+  if (isExactRuntimeModelSelection(modelInputTrimmed)) {
+    return getExactRuntimeModelId()!
+  }
+
   const normalizedModel = modelInputTrimmed.toLowerCase()
 
   const has1mTag = has1mContext(normalizedModel)

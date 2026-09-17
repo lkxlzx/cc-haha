@@ -5,7 +5,6 @@ import { logs } from '@opentelemetry/api-logs'
 // signal, but static imports would load all 6 (~1.2MB) on every startup.
 import {
   envDetector,
-  hostDetector,
   osDetector,
   resourceFromAttributes,
 } from '@opentelemetry/resources'
@@ -30,6 +29,7 @@ import {
   SEMRESATTRS_HOST_ARCH,
 } from '@opentelemetry/semantic-conventions'
 import { HttpsProxyAgent } from 'https-proxy-agent'
+import { normalizeHostArch } from './hostArch.js'
 import {
   getLoggerProvider,
   getMeterProvider,
@@ -490,14 +490,11 @@ export async function initializeTelemetry() {
     osDetector.detect().attributes || {},
   )
 
-  // Extract only host.arch from hostDetector
-  const hostDetected = hostDetector.detect()
-  const hostArchAttributes = hostDetected.attributes?.[SEMRESATTRS_HOST_ARCH]
-    ? {
-        [SEMRESATTRS_HOST_ARCH]: hostDetected.attributes[SEMRESATTRS_HOST_ARCH],
-      }
-    : {}
-  const hostArchResource = resourceFromAttributes(hostArchAttributes)
+  // hostDetector also probes the Windows MachineGuid through REG.exe. That
+  // subprocess can flash a console window, so derive only host.arch directly.
+  const hostArchResource = resourceFromAttributes({
+    [SEMRESATTRS_HOST_ARCH]: normalizeHostArch(),
+  })
 
   const envResource = resourceFromAttributes(
     envDetector.detect().attributes || {},

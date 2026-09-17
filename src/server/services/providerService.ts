@@ -10,6 +10,11 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
 import { ApiError } from '../middleware/errorHandler.js'
+import {
+  applyCustomRequestHeaders,
+  normalizeCustomHeaders,
+  type CustomRequestHeader,
+} from './customRequestHeaders.js'
 import { buildOpenaiEndpoint } from '../proxy/openaiEndpoint.js'
 import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.js'
 import { readRecoverableJsonFile } from './recoverableJsonFile.js'
@@ -46,8 +51,11 @@ import {
   normalizeModelMapping,
   normalizeProvidersIndex,
   providerNeedsProxy,
+  providerHasMultipleApiKeys,
+  resolveProviderApiKeys,
   resolveProviderApiKey,
 } from './providerRuntimeEnv.js'
+import { providerKeyPool } from './providerKeyPool.js'
 import {
   getNetworkProxyFetchOptions,
   loadNetworkSettings,
@@ -64,6 +72,9 @@ import type {
   ProviderTestStepResult,
   ApiFormat,
   ProviderAuthStrategy,
+  ProviderApiKey,
+  ProviderApiKeyInput,
+  ProviderLoadBalancing,
   RequestCompatibility,
 } from '../types/provider.js'
 import {
@@ -115,19 +126,81 @@ function mergeSavedOrderIntoDisplayOrder(providerOrder: string[], savedOrder: st
   })
 }
 
+function normalizeProviderApiKeyInputs(
+  inputs: ProviderApiKeyInput[] | undefined,
+  legacyApiKey: string,
+  existingKeys: ProviderApiKey[] = [],
+): ProviderApiKey[] {
+  const source = inputs ?? (
+    legacyApiKey.trim()
+      ? [{ apiKey: legacyApiKey }]
+      : []
+  )
+  const existingById = new Map(existingKeys.map((key) => [key.id, key]))
+  const seen = new Set<string>()
+  const keys: ProviderApiKey[] = []
+  for (const input of source) {
+    const requestedId = input.id?.trim()
+    if (requestedId && seen.has(requestedId)) continue
+    const apiKey = input.apiKey.trim() || (
+      requestedId
+        ? existingById.get(requestedId)?.apiKey.trim() ?? ''
+        : ''
+    )
+    if (!apiKey) continue
+    const id = requestedId || crypto.randomUUID()
+    if (seen.has(id)) continue
+    seen.add(id)
+    const label = input.label?.trim()
+    // An omitted proxyUrl (e.g. remote-browser edits never receive it) keeps
+    // the saved proxy; an explicit blank clears it.
+    const proxyUrl = input.proxyUrl === undefined
+      ? (requestedId ? existingById.get(requestedId)?.proxyUrl?.trim() ?? '' : '')
+      : input.proxyUrl.trim()
+    // Same semantics as proxyUrl: omitted keeps the saved headers (remote
+    // browser edits never send them); an explicit [] clears them.
+    const customHeaders = input.customHeaders === undefined
+      ? (requestedId ? existingById.get(requestedId)?.customHeaders ?? [] : [])
+      : normalizeCustomHeaders(input.customHeaders)
+
+    keys.push({
+      id,
+      ...(label ? { label } : {}),
+      apiKey,
+      ...(proxyUrl ? { proxyUrl } : {}),
+      ...(customHeaders.length > 0 ? { customHeaders } : {}),
+      enabled: input.enabled !== false,
+      weight: Math.min(1000, Math.max(1, Math.trunc(input.weight ?? 1))),
+    })
+  }
+  return keys
+}
+
+function firstEnabledProviderApiKey(keys: ProviderApiKey[]): ProviderApiKey | undefined {
+  return keys.find((key) => key.enabled)
+}
+
 function buildSavedProvider(input: CreateProviderInput): SavedProvider {
   const imageGeneration = normalizeImageGeneration(input.imageGeneration)
+  const apiKeys = normalizeProviderApiKeyInputs(input.apiKeys, input.apiKey)
+  const primaryApiKey = firstEnabledProviderApiKey(apiKeys)
+  const loadBalancing = input.loadBalancing ?? (
+    apiKeys.length > 0 ? { strategy: 'round_robin' as const } : undefined
+  )
   return {
     id: crypto.randomUUID(),
     presetId: input.presetId,
     name: input.name,
-    apiKey: input.apiKey,
+    apiKey: primaryApiKey?.apiKey ?? '',
+    ...(apiKeys.length > 0 && { apiKeys }),
+    ...(loadBalancing !== undefined && { loadBalancing }),
     ...(input.authStrategy !== undefined && { authStrategy: input.authStrategy }),
     baseUrl: input.baseUrl,
     apiFormat: input.apiFormat ?? 'anthropic',
     runtimeKind: input.runtimeKind ?? 'anthropic_compatible',
     models: normalizeModelMapping(input.models),
     ...(input.model1mSupport !== undefined && { model1mSupport: input.model1mSupport }),
+    ...(input.modelCatalog !== undefined && { modelCatalog: input.modelCatalog }),
     ...(input.autoCompactWindow !== undefined && { autoCompactWindow: input.autoCompactWindow }),
     ...(input.modelContextWindows !== undefined && { modelContextWindows: input.modelContextWindows }),
     toolSearchEnabled: input.toolSearchEnabled ?? false,
@@ -258,6 +331,7 @@ export class ProviderService {
     index.providerOrder = appendNewProviderToOrder(index.providerOrder, provider.id, index.providers)
     index.providers.push(provider)
     await this.writeIndex(index)
+    providerKeyPool.invalidate(provider.id)
     return provider
   }
 
@@ -291,19 +365,60 @@ export class ProviderService {
     if (idx === -1) throw ApiError.notFound(`Provider not found: ${id}`)
 
     const existing = index.providers[idx]
+    const existingApiKeys = resolveProviderApiKeys(existing)
+    let nextApiKeys: ProviderApiKey[] | undefined
+    if (input.apiKeys !== undefined) {
+      nextApiKeys = normalizeProviderApiKeyInputs(
+        input.apiKeys ?? [],
+        '',
+        existingApiKeys,
+      )
+    } else if (input.apiKey !== undefined) {
+      nextApiKeys = existingApiKeys.map((key) => ({ ...key }))
+      if (nextApiKeys.length === 0) {
+        if (input.apiKey.trim()) {
+          nextApiKeys.push({
+            id: crypto.randomUUID(),
+            apiKey: input.apiKey.trim(),
+            enabled: true,
+            weight: 1,
+          })
+        }
+      } else {
+        nextApiKeys[0] = {
+          ...nextApiKeys[0]!,
+          apiKey: input.apiKey.trim(),
+        }
+        nextApiKeys = nextApiKeys.filter((key) => key.apiKey.trim())
+      }
+    }
+    const primaryApiKey = nextApiKeys
+      ? firstEnabledProviderApiKey(nextApiKeys)
+      : undefined
+    const nextLoadBalancing: ProviderLoadBalancing | undefined =
+      input.loadBalancing === null
+        ? undefined
+        : input.loadBalancing ?? existing.loadBalancing
     const imageGeneration = input.imageGeneration
       ? normalizeImageGeneration(input.imageGeneration)
       : input.imageGeneration
     const updated: SavedProvider = {
       ...existing,
       ...(input.name !== undefined && { name: input.name }),
-      ...(input.apiKey !== undefined && { apiKey: input.apiKey }),
+      ...(nextApiKeys !== undefined && {
+        apiKey: primaryApiKey?.apiKey ?? '',
+        apiKeys: nextApiKeys,
+      }),
+      ...(input.loadBalancing !== undefined && nextLoadBalancing !== undefined && {
+        loadBalancing: nextLoadBalancing,
+      }),
       ...(input.authStrategy !== undefined && { authStrategy: input.authStrategy }),
       ...(input.baseUrl !== undefined && { baseUrl: input.baseUrl }),
       ...(input.apiFormat !== undefined && { apiFormat: input.apiFormat }),
       ...(input.runtimeKind !== undefined && { runtimeKind: input.runtimeKind }),
       ...(input.models !== undefined && { models: normalizeModelMapping(input.models) }),
       ...(input.model1mSupport !== undefined && input.model1mSupport !== null && { model1mSupport: input.model1mSupport }),
+      ...(input.modelCatalog !== undefined && input.modelCatalog !== null && { modelCatalog: input.modelCatalog }),
       ...(typeof input.autoCompactWindow === 'number' && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && input.modelContextWindows !== null && { modelContextWindows: input.modelContextWindows }),
       ...(input.toolSearchEnabled !== undefined && { toolSearchEnabled: input.toolSearchEnabled }),
@@ -315,6 +430,9 @@ export class ProviderService {
     }
     if (input.model1mSupport === null) {
       delete updated.model1mSupport
+    }
+    if (input.modelCatalog === null) {
+      delete updated.modelCatalog
     }
     if (input.autoCompactWindow === null) {
       delete updated.autoCompactWindow
@@ -331,9 +449,13 @@ export class ProviderService {
     if (imageGeneration === null) {
       delete updated.imageGeneration
     }
+    if (input.loadBalancing === null) {
+      delete updated.loadBalancing
+    }
 
     index.providers[idx] = updated
     await this.writeIndex(index)
+    providerKeyPool.invalidate(id)
 
     if (index.activeId === id) {
       await this.syncToSettings(updated)
@@ -354,6 +476,7 @@ export class ProviderService {
     index.providers.splice(idx, 1)
     index.providerOrder = index.providerOrder.filter((providerId) => providerId !== id)
     await this.writeIndex(index)
+    providerKeyPool.invalidate(id)
   }
 
   /**
@@ -538,6 +661,7 @@ export class ProviderService {
         const needsProxy = providerNeedsProxy(
           provider.apiFormat ?? 'anthropic',
           provider.supportsNestedToolResultMedia,
+          providerHasMultipleApiKeys(provider),
         )
         const authEnv = buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy)
         if (Object.values(authEnv).some(value => value.length > 0)) {
@@ -583,6 +707,8 @@ export class ProviderService {
     name: string
     baseUrl: string
     apiKey: string
+    apiKeys: ProviderApiKey[]
+    loadBalancing: ProviderLoadBalancing
     apiFormat: ApiFormat
     supportsNestedToolResultMedia: boolean
     authStrategy: ProviderAuthStrategy
@@ -590,11 +716,27 @@ export class ProviderService {
   } | null> {
     const toProxyConfig = (provider: SavedProvider) => {
       const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
+      const configuredApiKeys = resolveProviderApiKeys(provider)
+      const enabledApiKeys = configuredApiKeys.filter((key) => key.enabled)
+      const fallbackApiKey = resolveProviderApiKey(provider, presetDefaultEnv)
+      const hasExplicitKeyPool = provider.apiKeys !== undefined
+      const apiKeys = hasExplicitKeyPool
+        ? configuredApiKeys
+        : fallbackApiKey
+          ? [{
+              id: 'preset-default',
+              apiKey: fallbackApiKey,
+              enabled: true,
+              weight: 1,
+            }]
+          : []
       return {
         id: provider.id,
         name: provider.name,
         baseUrl: provider.baseUrl,
-        apiKey: resolveProviderApiKey(provider, presetDefaultEnv),
+        apiKey: enabledApiKeys[0]?.apiKey ?? (hasExplicitKeyPool ? '' : fallbackApiKey),
+        apiKeys,
+        loadBalancing: provider.loadBalancing ?? { strategy: 'round_robin' as const },
         apiFormat: provider.apiFormat ?? 'anthropic',
         supportsNestedToolResultMedia: provider.supportsNestedToolResultMedia ?? true,
         authStrategy: provider.authStrategy ?? getPresetAuthStrategy(provider.presetId),
@@ -620,6 +762,8 @@ export class ProviderService {
   async getActiveProviderForProxy(): Promise<{
     baseUrl: string
     apiKey: string
+    apiKeys: ProviderApiKey[]
+    loadBalancing: ProviderLoadBalancing
     apiFormat: ApiFormat
     supportsNestedToolResultMedia: boolean
     authStrategy: ProviderAuthStrategy
@@ -640,18 +784,76 @@ export class ProviderService {
     const apiFormat = provider.apiFormat ?? 'anthropic'
     const authStrategy = provider.authStrategy ?? getPresetAuthStrategy(provider.presetId)
     const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
-    const apiKey = resolveProviderApiKey(provider, presetDefaultEnv)
-      || (authStrategy === 'dual_dummy' ? 'dummy' : '')
+    const configuredKeys = provider.apiKeys !== undefined
+      ? resolveProviderApiKeys(provider).filter((key) => key.enabled)
+      : []
+    const fallbackApiKey = resolveProviderApiKey(provider, presetDefaultEnv)
+    const apiKeys: Array<{
+      apiKey: string
+      proxyUrl?: string
+      customHeaders?: ProviderApiKey['customHeaders']
+    }> = configuredKeys.length > 0
+      ? configuredKeys.map((key) => ({
+          apiKey: key.apiKey,
+          ...(key.proxyUrl?.trim() ? { proxyUrl: key.proxyUrl.trim() } : {}),
+          ...(key.customHeaders?.length ? { customHeaders: key.customHeaders } : {}),
+        }))
+      : fallbackApiKey
+        ? [{ apiKey: fallbackApiKey }]
+        : authStrategy === 'dual_dummy'
+          ? [{ apiKey: 'dummy' }]
+          : []
 
-    if (!baseUrl || !apiKey) {
+    if (!baseUrl || apiKeys.length === 0) {
       return { connectivity: { success: false, latencyMs: 0, error: 'Missing baseUrl or apiKey' } }
     }
+
+    let lastResult: ProviderTestResult | undefined
+    for (const entry of apiKeys) {
+      const result = await this.testProviderConfig({
+        baseUrl,
+        apiKey: entry.apiKey,
+        ...(entry.proxyUrl ? { proxyUrl: entry.proxyUrl } : {}),
+        ...(entry.customHeaders ? { customHeaders: entry.customHeaders } : {}),
+        modelId,
+        authStrategy,
+        apiFormat,
+        supportsNestedToolResultMedia: provider.supportsNestedToolResultMedia,
+        requestCompatibility: provider.requestCompatibility,
+      })
+      lastResult = result
+      if (result.connectivity.success) return result
+    }
+
+    return lastResult ?? {
+      connectivity: { success: false, latencyMs: 0, error: 'Missing baseUrl or apiKey' },
+    }
+  }
+
+  /** Test a single saved key (by key id) with its own proxy, if configured. */
+  async testProviderKey(
+    id: string,
+    keyId: string,
+    overrides?: { modelId?: string },
+  ): Promise<ProviderTestResult> {
+    const provider = await this.getProvider(id)
+    const key = resolveProviderApiKeys(provider).find((entry) => entry.id === keyId)
+    if (!key) throw ApiError.notFound(`API key not found: ${keyId}`)
+
+    const baseUrl = provider.baseUrl
+    const modelId = overrides?.modelId || provider.models.main
+    if (!baseUrl) {
+      return { connectivity: { success: false, latencyMs: 0, error: 'Missing baseUrl' } }
+    }
+
     return this.testProviderConfig({
       baseUrl,
-      apiKey,
+      apiKey: key.apiKey,
+      ...(key.proxyUrl?.trim() ? { proxyUrl: key.proxyUrl.trim() } : {}),
+      ...(key.customHeaders?.length ? { customHeaders: key.customHeaders } : {}),
       modelId,
-      authStrategy,
-      apiFormat,
+      authStrategy: provider.authStrategy ?? getPresetAuthStrategy(provider.presetId),
+      apiFormat: provider.apiFormat ?? 'anthropic',
       supportsNestedToolResultMedia: provider.supportsNestedToolResultMedia,
       requestCompatibility: provider.requestCompatibility,
     })
@@ -662,18 +864,26 @@ export class ProviderService {
     const authStrategy = input.authStrategy ?? 'api_key'
     const base = input.baseUrl.replace(/\/+$/, '')
     const modelId = normalizeModelStringForAPI(input.modelId)
-    const networkSettings = await loadNetworkSettings()
+    const baseNetworkSettings = await loadNetworkSettings()
+    const keyProxyUrl = input.proxyUrl?.trim()
+    const networkSettings = keyProxyUrl
+      ? { ...baseNetworkSettings, proxy: { mode: 'manual' as const, url: keyProxyUrl } }
+      : baseNetworkSettings
 
     // ── Step 1: Basic connectivity ───────────────────────────
     // Directly call the upstream API to verify URL, key, and model.
-    const step1 = await this.testConnectivity(base, input.apiKey, modelId, format, authStrategy, networkSettings, input.requestCompatibility)
+    const step1 = await this.testConnectivity(base, input.apiKey, modelId, format, authStrategy, networkSettings, input.requestCompatibility, input.customHeaders)
 
     // If connectivity failed, no point running step 2
     if (!step1.success) {
       return { connectivity: step1 }
     }
 
-    if (!providerNeedsProxy(format, input.supportsNestedToolResultMedia)) {
+    if (!providerNeedsProxy(
+      format,
+      input.supportsNestedToolResultMedia,
+      false,
+    )) {
       return { connectivity: step1 }
     }
 
@@ -687,6 +897,7 @@ export class ProviderService {
       authStrategy,
       networkSettings,
       input.requestCompatibility,
+      input.customHeaders,
     )
 
     return { connectivity: step1, proxy: step2 }
@@ -701,15 +912,17 @@ export class ProviderService {
     authStrategy: ProviderAuthStrategy,
     networkSettings: NetworkSettings,
     requestCompatibility?: RequestCompatibility,
+    customHeaders?: CustomRequestHeader[],
   ): Promise<ProviderTestStepResult> {
     const start = Date.now()
     try {
-      const { url, headers, body } = buildDirectTestRequest(base, apiKey, modelId, format, authStrategy, requestCompatibility)
-      const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
-      const response = await fetch(url, {
+      const direct = buildDirectTestRequest(base, apiKey, modelId, format, authStrategy, requestCompatibility)
+      const headers = applyCustomRequestHeaders(direct.headers, customHeaders)
+      const proxyOptions = getNetworkProxyFetchOptions(networkSettings, direct.url)
+      const response = await fetch(direct.url, {
         method: 'POST',
         headers,
-        body: JSON.stringify(body),
+        body: JSON.stringify(direct.body),
         signal: AbortSignal.timeout(networkSettings.aiRequestTimeoutMs),
         ...proxyOptions,
       })
@@ -750,6 +963,7 @@ export class ProviderService {
     authStrategy: ProviderAuthStrategy,
     networkSettings: NetworkSettings,
     requestCompatibility?: RequestCompatibility,
+    customHeaders?: CustomRequestHeader[],
   ): Promise<ProviderTestStepResult> {
     const start = Date.now()
     try {
@@ -780,6 +994,7 @@ export class ProviderService {
           ...buildAnthropicAuthHeaders(apiKey, authStrategy),
         }
       }
+      headers = applyCustomRequestHeaders(headers, customHeaders)
       const proxyOptions = getNetworkProxyFetchOptions(networkSettings, upstreamUrl)
 
       // Call upstream with transformed request

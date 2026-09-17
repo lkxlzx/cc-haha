@@ -409,14 +409,26 @@ export class DiagnosticsService {
     await this.ensureLogDir()
     const dir = this.getLogDir()
     if (process.platform === 'darwin') {
-      Bun.spawn(['open', dir], { stdout: 'ignore', stderr: 'ignore' })
+      Bun.spawn(['open', dir], {
+        stdout: 'ignore',
+        stderr: 'ignore',
+        windowsHide: true,
+      })
       return
     }
     if (process.platform === 'win32') {
-      Bun.spawn(['cmd', '/c', 'start', '', dir], { stdout: 'ignore', stderr: 'ignore' })
+      Bun.spawn(['cmd', '/c', 'start', '', dir], {
+        stdout: 'ignore',
+        stderr: 'ignore',
+        windowsHide: true,
+      })
       return
     }
-    Bun.spawn(['xdg-open', dir], { stdout: 'ignore', stderr: 'ignore' })
+    Bun.spawn(['xdg-open', dir], {
+      stdout: 'ignore',
+      stderr: 'ignore',
+      windowsHide: true,
+    })
   }
 
   async clear(): Promise<void> {

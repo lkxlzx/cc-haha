@@ -1000,6 +1000,52 @@ describe('Models API', () => {
     }])
   })
 
+  it('GET /api/models should include enabled provider catalog models', async () => {
+    const providerSvc = new ProviderService()
+    const provider = await providerSvc.addProvider({
+      presetId: 'custom',
+      name: 'Catalog provider',
+      baseUrl: 'https://api.example.com',
+      apiKey: 'test-key',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'main-model',
+        haiku: 'fast-model',
+        sonnet: 'main-model',
+        opus: 'main-model',
+      },
+      modelCatalog: [
+        { id: 'catalog-model', name: 'Catalog Model', contextWindow: 200000 },
+        { id: 'long-model', supports1m: true },
+        { id: 'disabled-model', enabled: false },
+      ],
+    })
+    await providerSvc.activateProvider(provider.id)
+
+    const { req, url, segments } = makeRequest('GET', '/api/models')
+    const res = await handleModelsApi(req, url, segments)
+    const body = await res.json() as { models: Array<{ id: string; description: string; context: string }> }
+
+    expect(res.status).toBe(200)
+    expect(body.models).toEqual(expect.arrayContaining([
+      {
+        id: 'catalog-model',
+        name: 'catalog-model',
+        description: 'Catalog Model',
+        context: '200000',
+        supportedReasoningEfforts: [],
+      },
+      {
+        id: 'long-model[1m]',
+        name: 'long-model[1m]',
+        description: 'Custom model',
+        context: '',
+        supportedReasoningEfforts: [],
+      },
+    ]))
+    expect(body.models.some((model) => model.id === 'disabled-model')).toBe(false)
+  })
+
   it('GET /api/models should expose only standard API effort for GLM 5.3', async () => {
     const providerSvc = new ProviderService()
     const provider = await providerSvc.addProvider({

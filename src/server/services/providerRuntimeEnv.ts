@@ -15,15 +15,19 @@ import {
   IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
 } from '../../services/imageGeneration/config.js'
 import { PROVIDER_PRESETS } from '../config/providerPresets.js'
+import { normalizeCustomHeaders } from './customRequestHeaders.js'
 import type {
   ApiFormat,
+  ProviderApiKey,
   ProviderAuthStrategy,
+  ProviderLoadBalancing,
   ProvidersIndex,
   SavedProvider,
 } from '../types/provider.js'
 import {
   BUILT_IN_PROVIDER_IDS,
   PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,
+  ProviderLoadBalancingStrategySchema,
 } from '../types/provider.js'
 import {
   ATTRIBUTION_HEADER_ENV_KEY,
@@ -110,6 +114,31 @@ function isImageGenerationConfig(
   )
 }
 
+function isProviderApiKey(value: unknown): value is ProviderApiKey {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    !!value.id.trim() &&
+    (value.label === undefined || typeof value.label === 'string') &&
+    typeof value.apiKey === 'string' &&
+    !!value.apiKey.trim() &&
+    (value.proxyUrl === undefined || typeof value.proxyUrl === 'string') &&
+    (value.customHeaders === undefined || Array.isArray(value.customHeaders)) &&
+    typeof value.enabled === 'boolean' &&
+    typeof value.weight === 'number' &&
+    Number.isInteger(value.weight) &&
+    value.weight >= 1 &&
+    value.weight <= 1000
+  )
+}
+
+function isProviderLoadBalancing(value: unknown): value is ProviderLoadBalancing {
+  return (
+    isRecord(value) &&
+    ProviderLoadBalancingStrategySchema.safeParse(value.strategy).success
+  )
+}
+
 function isSavedProvider(value: unknown): value is SavedProvider {
   if (!isRecord(value)) return false
   const runtimeKind = value.runtimeKind
@@ -118,6 +147,9 @@ function isSavedProvider(value: unknown): value is SavedProvider {
     typeof value.presetId === 'string' &&
     typeof value.name === 'string' &&
     typeof value.apiKey === 'string' &&
+    (value.apiKeys === undefined ||
+      (Array.isArray(value.apiKeys) && value.apiKeys.every(isProviderApiKey))) &&
+    (value.loadBalancing === undefined || isProviderLoadBalancing(value.loadBalancing)) &&
     typeof value.baseUrl === 'string' &&
     (
       runtimeKind === undefined ||
@@ -193,6 +225,138 @@ export function normalizeImageGeneration(
   }
 }
 
+function normalizeProviderApiKeys(value: unknown): ProviderApiKey[] | undefined {
+  if (!Array.isArray(value)) return undefined
+
+  const seen = new Set<string>()
+  const keys: ProviderApiKey[] = []
+  for (const entry of value) {
+    if (!isRecord(entry)) continue
+    const apiKey = typeof entry.apiKey === 'string' ? entry.apiKey.trim() : ''
+    if (!apiKey) continue
+    const rawId = typeof entry.id === 'string' ? entry.id.trim() : ''
+    const id = rawId && !seen.has(rawId) ? rawId : crypto.randomUUID()
+    if (seen.has(id)) continue
+    seen.add(id)
+
+    const label = typeof entry.label === 'string' ? entry.label.trim() : ''
+    const weight =
+      typeof entry.weight === 'number' &&
+      Number.isInteger(entry.weight) &&
+      entry.weight >= 1 &&
+      entry.weight <= 1000
+        ? entry.weight
+        : 1
+
+    const customHeaders = normalizeCustomHeaders(entry.customHeaders)
+
+    keys.push({
+      id,
+      ...(label ? { label } : {}),
+      apiKey,
+      ...(typeof entry.proxyUrl === 'string' && entry.proxyUrl.trim()
+        ? { proxyUrl: entry.proxyUrl.trim() }
+        : {}),
+      ...(customHeaders.length > 0 ? { customHeaders } : {}),
+      enabled: entry.enabled !== false,
+      weight,
+    })
+  }
+
+  return keys
+}
+
+function normalizeProviderLoadBalancing(
+  value: unknown,
+): ProviderLoadBalancing | undefined {
+  if (!isRecord(value)) return undefined
+  const strategy = ProviderLoadBalancingStrategySchema.safeParse(value.strategy)
+  return strategy.success ? { strategy: strategy.data } : undefined
+}
+
+export function resolveProviderApiKeys(
+  provider: Pick<SavedProvider, 'apiKey' | 'apiKeys'>,
+): ProviderApiKey[] {
+  const configured = normalizeProviderApiKeys(provider.apiKeys)
+  if (configured !== undefined) return configured
+
+  const legacyKey = provider.apiKey.trim()
+  return legacyKey
+    ? [{
+        id: 'primary',
+        apiKey: legacyKey,
+        enabled: true,
+        weight: 1,
+      }]
+    : []
+}
+
+export function getEnabledProviderApiKeys(
+  provider: Pick<SavedProvider, 'apiKey' | 'apiKeys'>,
+): ProviderApiKey[] {
+  return resolveProviderApiKeys(provider).filter((key) => key.enabled)
+}
+
+export function providerHasMultipleApiKeys(
+  provider: Pick<SavedProvider, 'apiKey' | 'apiKeys'>,
+): boolean {
+  return getEnabledProviderApiKeys(provider).length > 1
+}
+
+function baseCatalogModelId(modelId: string): string {
+  return modelId.trim().replace(/\[1m\]$/i, '').replace(/:1m$/i, '').trim()
+}
+
+export function isEnabledProviderCatalogModel(
+  provider: SavedProvider,
+  modelId: string,
+): boolean {
+  const requestedModelId = baseCatalogModelId(modelId).toLowerCase()
+  if (!requestedModelId) return false
+
+  return (provider.modelCatalog ?? []).some(
+    (model) =>
+      model.enabled !== false &&
+      baseCatalogModelId(model.id).toLowerCase() === requestedModelId,
+  )
+}
+
+function normalizeProviderCatalogModels(
+  value: unknown,
+): SavedProvider['modelCatalog'] | undefined {
+  if (!Array.isArray(value)) return undefined
+
+  const seen = new Set<string>()
+  const models: NonNullable<SavedProvider['modelCatalog']> = []
+  for (const entry of value) {
+    if (!isRecord(entry) || typeof entry.id !== 'string') continue
+    const id = entry.id.trim()
+    const key = baseCatalogModelId(id)
+    if (!id || !key || seen.has(key)) continue
+    seen.add(key)
+
+    const name = typeof entry.name === 'string' ? entry.name.trim() : ''
+    const contextWindow = entry.contextWindow
+    const normalizedContextWindow =
+      typeof contextWindow === 'number' &&
+      Number.isInteger(contextWindow) &&
+      contextWindow >= 16000 &&
+      contextWindow <= 10000000
+        ? contextWindow
+        : undefined
+
+    models.push({
+      id,
+      ...(name ? { name } : {}),
+      ...(normalizedContextWindow !== undefined ? { contextWindow: normalizedContextWindow } : {}),
+      ...(typeof entry.supports1m === 'boolean' ? { supports1m: entry.supports1m } : {}),
+      ...(typeof entry.enabled === 'boolean' ? { enabled: entry.enabled } : {}),
+    })
+  }
+
+  return models.length > 0 ? models : undefined
+}
+
 function applyModel1mSupport(model: string, enabled: boolean | undefined): string {
   const trimmed = model.trim()
   if (!enabled) return trimmed
@@ -217,14 +381,32 @@ export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
     disableExperimentalBetas: rawDisableExperimentalBetas,
     imageGeneration: rawImageGeneration,
     model1mSupport: rawModel1mSupport,
+    modelCatalog: rawModelCatalog,
     supportsNestedToolResultMedia: rawSupportsNestedToolResultMedia,
     ...rest
   } = provider
   const rawProvider = provider as SavedProvider & Record<string, unknown>
   const model1mSupport = normalizeModel1mSupport(rawModel1mSupport)
+  const modelCatalog = normalizeProviderCatalogModels(rawModelCatalog)
   const imageGeneration = normalizeImageGeneration(rawImageGeneration)
+  const loadBalancing = normalizeProviderLoadBalancing(provider.loadBalancing)
+  const explicitApiKeys = normalizeProviderApiKeys(provider.apiKeys)
+  const apiKeys = explicitApiKeys ?? (
+    provider.apiKey.trim()
+      ? [{
+          id: 'primary',
+          apiKey: provider.apiKey.trim(),
+          enabled: true,
+          weight: 1,
+        }]
+      : undefined
+  )
+  const apiKey = apiKeys?.find((key) => key.enabled)?.apiKey ?? ''
   return {
     ...rest,
+    apiKey,
+    ...(apiKeys !== undefined && { apiKeys }),
+    ...(loadBalancing !== undefined && { loadBalancing }),
     apiFormat: provider.apiFormat ?? 'anthropic',
     runtimeKind: provider.runtimeKind ?? 'anthropic_compatible',
     models: normalizeModelMapping(provider.models),
@@ -234,6 +416,7 @@ export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
       : {}),
     ...(normalizeDisableExperimentalBetas(rawDisableExperimentalBetas) ? { disableExperimentalBetas: true } : {}),
     ...(model1mSupport !== undefined ? { model1mSupport } : {}),
+    ...(modelCatalog !== undefined ? { modelCatalog } : {}),
     ...(imageGeneration !== undefined ? { imageGeneration } : {}),
   }
 }
@@ -351,6 +534,14 @@ function getPresetModelContextWindows(presetId: string): Record<string, number> 
   return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.modelContextWindows ?? {}
 }
 
+function getCatalogModelContextWindows(provider: SavedProvider): Record<string, number> {
+  return Object.fromEntries(
+    (provider.modelCatalog ?? [])
+      .filter((model) => model.enabled !== false && model.contextWindow !== undefined)
+      .map((model) => [model.id.trim(), model.contextWindow!]),
+  )
+}
+
 function getProviderCapabilityEnv(
   provider: SavedProvider,
   models: SavedProvider['models'],
@@ -377,7 +568,8 @@ export function resolveProviderApiKey(
   provider: SavedProvider,
   presetDefaultEnv: Record<string, string>,
 ): string {
-  return provider.apiKey
+  return getEnabledProviderApiKeys(provider).find((key) => key.apiKey.trim())?.apiKey
+    || provider.apiKey
     || presetDefaultEnv.ANTHROPIC_AUTH_TOKEN
     || presetDefaultEnv.ANTHROPIC_API_KEY
     || ''
@@ -424,8 +616,13 @@ export function getManagedEnvKeys(): string[] {
 export function providerNeedsProxy(
   apiFormat: ApiFormat,
   supportsNestedToolResultMedia?: boolean,
+  hasMultipleApiKeys = false,
 ): boolean {
-  return apiFormat !== 'anthropic' || supportsNestedToolResultMedia === false
+  return (
+    apiFormat !== 'anthropic' ||
+    supportsNestedToolResultMedia === false ||
+    hasMultipleApiKeys
+  )
 }
 
 export function buildProviderManagedEnv(
@@ -443,7 +640,11 @@ export function buildProviderManagedEnv(
   // Anthropic-format providers normally connect directly to the upstream. When
   // the provider opts out of nested tool-result media, route through the proxy
   // so images/documents are lifted out of tool_result before forwarding.
-  const needsProxy = providerNeedsProxy(apiFormat, provider.supportsNestedToolResultMedia)
+  const needsProxy = providerNeedsProxy(
+    apiFormat,
+    provider.supportsNestedToolResultMedia,
+    providerHasMultipleApiKeys(provider),
+  )
   const proxyPath = options?.proxyPath ?? '/proxy'
   const serverPort = options?.serverPort ?? 3456
   const baseUrl = needsProxy
@@ -454,6 +655,7 @@ export function buildProviderManagedEnv(
   const runtimeModels = applyModel1mSupportMapping(models, provider.model1mSupport)
   const modelContextWindows = {
     ...getPresetModelContextWindows(provider.presetId),
+    ...getCatalogModelContextWindows(provider),
     ...(provider.modelContextWindows ?? {}),
   }
 
@@ -540,6 +742,7 @@ export function activeProviderNeedsProxy(configDir: string): boolean {
     return providerNeedsProxy(
       provider.apiFormat ?? 'anthropic',
       provider.supportsNestedToolResultMedia,
+      providerHasMultipleApiKeys(provider),
     )
   } catch {
     return false

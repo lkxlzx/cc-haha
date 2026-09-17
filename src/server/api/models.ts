@@ -47,6 +47,7 @@ import {
   type ModelReasoningApiFormat,
   type ModelReasoningProviderKind,
 } from '../../shared/modelReasoning.js'
+import type { ProviderCatalogModel } from '../types/provider.js'
 
 // ─── Fallback models (used when no provider is configured) ────────────────────
 
@@ -121,6 +122,17 @@ function addUniqueModel(
   models.push(model)
 }
 
+function baseProviderModelId(modelId: string): string {
+  return modelId.trim().replace(/\[1m\]$/i, '').replace(/:1m$/i, '').trim()
+}
+
+function buildCatalogRuntimeModelId(model: ProviderCatalogModel): string {
+  const baseId = baseProviderModelId(model.id)
+  if (model.supports1m === true) return `${baseId}[1m]`
+  if (model.supports1m === false) return baseId
+  return model.id.trim()
+}
+
 function buildProviderModelList(
   models: {
     main: string
@@ -132,10 +144,16 @@ function buildProviderModelList(
   apiFormat?: ModelReasoningApiFormat,
   presetDefaultEnv: Record<string, string> = {},
   providerKind?: ModelReasoningProviderKind,
+  catalog: ProviderCatalogModel[] = [],
+  modelContextWindows: Record<string, number> = {},
 ): ApiModelInfo[] {
   const modelList: ApiModelInfo[] = []
 
-  const buildModel = (id: string, description: string): ApiModelInfo => {
+  const buildModel = (
+    id: string,
+    description: string,
+    contextWindow?: number,
+  ): ApiModelInfo => {
     const reasoningProfile = apiFormat
       ? resolveModelReasoningProfile(
           id,
@@ -148,7 +166,7 @@ function buildProviderModelList(
       id,
       name: id,
       description,
-      context: '',
+      context: contextWindow ? String(contextWindow) : '',
       ...(apiFormat
         ? {
             supportedReasoningEfforts: [...(reasoningProfile?.supportedReasoningEfforts ?? [])],
@@ -173,6 +191,18 @@ function buildProviderModelList(
   addUniqueModel(modelList, models.fable
     ? buildModel(models.fable, 'Fable model')
     : null)
+  for (const catalogModel of catalog) {
+    if (catalogModel.enabled === false) continue
+    const id = buildCatalogRuntimeModelId(catalogModel)
+    if (!id) continue
+    addUniqueModel(modelList, buildModel(
+      id,
+      catalogModel.name?.trim() || 'Custom model',
+      catalogModel.contextWindow ??
+        modelContextWindows[id] ??
+        modelContextWindows[catalogModel.id.trim()],
+    ))
+  }
 
   return modelList
 }
@@ -328,6 +358,8 @@ async function handleModelsList(): Promise<Response> {
       activeProvider.apiFormat,
       getPresetDefaultEnv(activeProvider.presetId),
       getPresetReasoningProviderKind(activeProvider.presetId),
+      activeProvider.modelCatalog,
+      activeProvider.modelContextWindows,
     )
     return Response.json({
       models: modelList,
@@ -406,6 +438,8 @@ async function handleCurrentModel(req: Request): Promise<Response> {
               activeProvider.apiFormat,
               getPresetDefaultEnv(activeProvider.presetId),
               getPresetReasoningProviderKind(activeProvider.presetId),
+              activeProvider.modelCatalog,
+              activeProvider.modelContextWindows,
             )
           : claudeOfficialModel
             ? [...DEFAULT_MODELS]

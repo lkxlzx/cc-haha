@@ -5,7 +5,14 @@ const nonempty = (value: unknown): value is string => typeof value === 'string' 
 /** A redacted credential may be reused only at its existing destination. */
 export function remoteProviderNeedsCredentials(current: SavedProvider, input: Record<string, unknown>): boolean {
   const nextBaseUrl = typeof input.baseUrl === 'string' ? input.baseUrl : current.baseUrl
-  const replacesMainKey = nonempty(input.apiKey)
+  const replacesMainKey = nonempty(input.apiKey) || (
+    Array.isArray(input.apiKeys) &&
+    input.apiKeys.some((key) =>
+      !!key &&
+      typeof key === 'object' &&
+      nonempty((key as Record<string, unknown>).apiKey),
+    )
+  )
   if (current.apiKey && nextBaseUrl !== current.baseUrl && !replacesMainKey) return true
 
   if (input.imageGeneration === null) return false

@@ -2296,7 +2296,8 @@ describe('Settings > Providers tab', () => {
     fireEvent.click(addButton)
 
     const dialog = screen.getByRole('dialog')
-    expect(within(dialog).getByLabelText(/Name/i)).toHaveValue('Custom')
+    // Anchored: the key pool also renders a per-key "Name" field.
+    expect(within(dialog).getByLabelText(/Configuration name/i)).toHaveValue('Custom')
     expect(within(dialog).getByRole('textbox', { name: /Base URL/i })).toBeEnabled()
 
     const baseUrlInfo = within(dialog).getByRole('button', { name: 'Base URL help' })
@@ -2320,7 +2321,9 @@ describe('Settings > Providers tab', () => {
 
       const dialog = screen.getByRole('dialog')
       await waitFor(() => expect(settleSettings).toBeTypeOf('function'))
-      expect(within(dialog).queryByRole('combobox')).not.toBeInTheDocument()
+      expect(
+        within(dialog).queryByRole('combobox', { name: (name) => !/load balancing/i.test(name) }),
+      ).not.toBeInTheDocument()
       const regionTrigger = within(dialog).getByRole('button', { name: /China mainland/ })
       const baseUrlInput = within(dialog).getByRole('textbox', { name: /Base URL/i })
       expect(baseUrlInput).toHaveValue('https://open.bigmodel.cn/api/anthropic')
@@ -2404,7 +2407,11 @@ describe('Settings > Providers tab', () => {
     fireEvent.click(screen.getByRole('button', { name: /Add Model/i }))
 
     const dialog = screen.getByRole('dialog')
-    expect(within(dialog).queryByRole('combobox')).not.toBeInTheDocument()
+    // The key pool's (disabled) Load balancing select is allowed here; assert
+    // nothing else in the form is a native combobox.
+    expect(
+      within(dialog).queryByRole('combobox', { name: (name) => !/load balancing/i.test(name) }),
+    ).not.toBeInTheDocument()
 
     fireEvent.click(within(dialog).getByRole('button', { name: /Anthropic Messages \(native\)/i }))
     fireEvent.click(within(dialog).getByRole('option', { name: /OpenAI Responses API \(proxy\)/i }))
@@ -2541,7 +2548,7 @@ describe('Settings > Providers tab', () => {
     })
     fireEvent.change(within(dialog).getByPlaceholderText('sk-...'), { target: { value: 'sk-test' } })
     fireEvent.change(within(dialog).getByLabelText(/Main Model|主模型/i), { target: { value: 'gpt-5.5' } })
-    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
+    fireEvent.click(within(dialog).getByRole('button', { name: /^(Save|Add|保存|添加)$/i }))
 
     await waitFor(() => {
       expect(providerStoreState.createProvider).toHaveBeenCalledWith(expect.objectContaining({
@@ -2648,7 +2655,7 @@ describe('Settings > Providers tab', () => {
       modelId: 'deepseek-v4-pro',
     }))
 
-    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
+    fireEvent.click(within(dialog).getByRole('button', { name: /^(Save|Add|保存|添加)$/i }))
 
     await waitFor(() => {
       expect(providerStoreState.createProvider).toHaveBeenCalledWith(expect.objectContaining({
@@ -2695,7 +2702,7 @@ describe('Settings > Providers tab', () => {
     })
 
     fireEvent.change(within(dialog).getByPlaceholderText('sk-...'), { target: { value: 'sk-test' } })
-    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
+    fireEvent.click(within(dialog).getByRole('button', { name: /^(Save|Add|保存|添加)$/i }))
 
     await waitFor(() => {
       expect(providerStoreState.createProvider).toHaveBeenCalledTimes(1)
@@ -2705,7 +2712,7 @@ describe('Settings > Providers tab', () => {
     expect(cancelButton).toBeDisabled()
 
     fireEvent.click(cancelButton)
-    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
+    fireEvent.click(within(dialog).getByRole('button', { name: /^(Save|Add|保存|添加)$/i }))
 
     expect(screen.getByRole('dialog')).toBeInTheDocument()
     expect(providerStoreState.createProvider).toHaveBeenCalledTimes(1)
@@ -2796,7 +2803,7 @@ describe('Settings > Providers tab', () => {
     })
 
     fireEvent.change(within(dialog).getByPlaceholderText('sk-...'), { target: { value: 'sk-test' } })
-    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add/i }))
+    fireEvent.click(within(dialog).getByRole('button', { name: /^(Save|Add)$/i }))
 
     await waitFor(() => {
       expect(providerStoreState.createProvider).toHaveBeenCalledWith(expect.objectContaining({
@@ -2869,7 +2876,7 @@ describe('Settings > Providers tab', () => {
     })
 
     fireEvent.change(within(dialog).getByPlaceholderText('sk-...'), { target: { value: 'sk-test' } })
-    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add/i }))
+    fireEvent.click(within(dialog).getByRole('button', { name: /^(Save|Add)$/i }))
 
     await waitFor(() => {
       expect(providerStoreState.createProvider).toHaveBeenCalledWith(expect.objectContaining({
@@ -2940,7 +2947,7 @@ describe('Settings > Providers tab', () => {
       expect(settingsTextarea?.value).toContain('"CLAUDE_CODE_MODEL_CONTEXT_WINDOWS"')
       expect(settingsTextarea?.value).toContain('\\"claude-sonnet-4-6\\":1000000')
     })
-    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
+    fireEvent.click(within(dialog).getByRole('button', { name: /^(Save|Add|保存|添加)$/i }))
 
     await waitFor(() => {
       expect(providerStoreState.createProvider).toHaveBeenCalledWith(expect.objectContaining({
@@ -3186,9 +3193,11 @@ describe('Settings > Providers tab', () => {
     })
 
     fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
-    const comboboxes = await within(dialog).findAllByRole('combobox')
-    const mainCombobox = comboboxes[0]!
-    const haikuCombobox = comboboxes[1]!
+    // Select by accessible name: the key pool adds a (disabled) Load
+    // balancing combobox, so positional indexing no longer maps to the
+    // main/haiku model pickers.
+    const mainCombobox = await within(dialog).findByRole('combobox', { name: /Main Model|主模型/i })
+    const haikuCombobox = await within(dialog).findByRole('combobox', { name: /Haiku Model|Haiku 模型/i })
 
     fireEvent.focus(mainCombobox)
     expect(mainCombobox).toHaveAttribute('aria-expanded', 'true')
@@ -3216,12 +3225,15 @@ describe('Settings > Providers tab', () => {
     const mainCombobox = await within(dialog).findByRole('combobox', { name: /Main Model|主模型/i })
     fireEvent.click(mainCombobox)
 
-    expect(within(dialog).getAllByRole('option')).toHaveLength(100)
+    // Scope options to the model popup's own listbox — the disabled Load
+    // balancing <select> also renders <option>s the combobox would otherwise count.
+    const popup = within(within(dialog).getByRole('listbox'))
+    expect(popup.getAllByRole('option')).toHaveLength(100)
     expect(within(dialog).getByText(/More models are available/i)).toBeInTheDocument()
 
     fireEvent.change(mainCombobox, { target: { value: 'model-100' } })
 
-    expect(within(dialog).getAllByRole('option')).toHaveLength(1)
+    expect(popup.getAllByRole('option')).toHaveLength(1)
     expect(within(dialog).getByRole('option', { name: 'model-100' })).toBeInTheDocument()
     expect(within(dialog).queryByText(/More models are available/i)).not.toBeInTheDocument()
   })
@@ -3249,7 +3261,7 @@ describe('Settings > Providers tab', () => {
     // code still picks the headline, the raw text only rides along under it.
     expect(within(dialog).getByText(/upstream said no/)).toBeInTheDocument()
     expect(within(dialog).queryByRole('button', { name: /from the fetched list/i })).not.toBeInTheDocument()
-    expect(within(dialog).queryByRole('combobox')).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('combobox', { name: /Main Model|主模型/i })).not.toBeInTheDocument()
   })
 
   it('surfaces the upstream message when a 200 response cloaks an auth failure', async () => {

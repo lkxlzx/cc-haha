@@ -5,10 +5,28 @@ import { SettingsService } from './services/settingsService.js'
 import { conversationService } from './services/conversationService.js'
 import type { SavedProvider } from './types/provider.js'
 
+const catalogModel = {
+  id: 'fixture-catalog-model',
+  name: 'Fixture Catalog Model',
+  contextWindow: 200000,
+  supports1m: false,
+  enabled: true,
+  privateFutureField: 'fake-catalog-secret',
+}
+
+const publicCatalogModel = {
+  id: 'fixture-catalog-model',
+  name: 'Fixture Catalog Model',
+  contextWindow: 200000,
+  supports1m: false,
+  enabled: true,
+}
+
 const provider: SavedProvider = {
   id: 'fixture-provider', presetId: 'custom', name: 'Fixture', apiKey: 'fake-existing-key',
   baseUrl: 'https://fixture.invalid', apiFormat: 'anthropic', runtimeKind: 'anthropic_compatible',
   models: { main: 'fixture-model', haiku: 'fixture-model', sonnet: 'fixture-model', opus: 'fixture-model' },
+  modelCatalog: [catalogModel],
   imageGeneration: { model: 'fixture-image', apiKey: 'fake-image-key' },
   requestCompatibility: { maxOutputTokens: 2048, privateFutureField: 'fake-hidden-value' },
   ...{ futureCredential: 'fake-top-level-secret', env: { PRIVATE_KEY: 'fake-env-secret' } },
@@ -45,15 +63,38 @@ describe('remote browser API routing', () => {
       expect(result.hasApiKey).toBe(true)
       expect(result.imageGeneration).toEqual({ model: 'fixture-image', apiKey: '', hasApiKey: true })
       expect(result.requestCompatibility).toEqual({ maxOutputTokens: 2048 })
+      expect(result.modelCatalog).toEqual([publicCatalogModel])
       expect(JSON.stringify(data)).not.toContain('fake-existing-key')
       expect(JSON.stringify(data)).not.toContain('fake-top-level-secret')
       expect(JSON.stringify(data)).not.toContain('fake-env-secret')
+      expect(JSON.stringify(data)).not.toContain('fake-catalog-secret')
     }
     const created = await request('/api/providers', 'POST', { ...provider, apiKey: 'fake-new-key' })
     expect(created.status).toBe(201)
     expect((await created.json()).provider.apiKey).toBe('')
-    expect(ProviderService.prototype.addProvider).toHaveBeenCalledWith(expect.objectContaining({ apiKey: 'fake-new-key' }))
+    expect(ProviderService.prototype.addProvider).toHaveBeenCalledWith(expect.objectContaining({
+      apiKey: 'fake-new-key',
+      modelCatalog: [publicCatalogModel],
+    }))
     expect((await (await request(`/api/providers/${provider.id}`, 'GET', undefined, false)).json()).provider.apiKey).toBe(provider.apiKey)
+  })
+
+  test('projects model catalog updates through the same whitelist as provider reads', async () => {
+    const response = await request(`/api/providers/${provider.id}`, 'PUT', {
+      modelCatalog: [{
+        ...catalogModel,
+        id: 'updated-catalog-model',
+        privateFutureField: 'fake-updated-catalog-secret',
+      }],
+    })
+
+    expect(response.status).toBe(200)
+    expect(ProviderService.prototype.updateProvider).toHaveBeenLastCalledWith(provider.id, {
+      modelCatalog: [{ ...publicCatalogModel, id: 'updated-catalog-model' }],
+    })
+    const data = await response.json()
+    expect(data.provider.modelCatalog).toEqual([{ ...publicCatalogModel, id: 'updated-catalog-model' }])
+    expect(JSON.stringify(data)).not.toContain('fake-updated-catalog-secret')
   })
 
   test('blank primary/image keys preserve secrets and compatibility updates preserve hidden future fields', async () => {

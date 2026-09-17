@@ -14,6 +14,7 @@ import type { SavedProvider } from '@/types/provider'
 
 const saved: SavedProvider = {
   id: 'fixture-provider', name: 'Fixture provider', presetId: 'custom', baseUrl: 'https://fixture.example', apiKey: '', apiFormat: 'anthropic',
+  apiKeys: [{ id: 'primary', apiKey: '', enabled: true, weight: 1 }],
   models: { main: 'fixture-model', haiku: 'fixture-model', sonnet: 'fixture-model', opus: 'fixture-model' },
 }
 beforeEach(() => {

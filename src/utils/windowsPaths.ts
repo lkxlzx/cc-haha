@@ -14,7 +14,10 @@ import { getPlatform } from './platform.js'
  */
 function checkPathExists(path: string): boolean {
   try {
-    execSync_DEPRECATED(`dir "${path}"`, { stdio: 'pipe' })
+    execSync_DEPRECATED(`dir "${path}"`, {
+      stdio: 'pipe',
+      windowsHide: true,
+    })
     return true
   } catch {
     return false
@@ -49,6 +52,7 @@ function findExecutable(executable: string): string | null {
     const result = execSync_DEPRECATED(`where.exe ${executable}`, {
       stdio: 'pipe',
       encoding: 'utf8',
+      windowsHide: true,
     }).trim()
 
     // SECURITY: Filter out any results from the current directory

@@ -464,6 +464,83 @@ describe('titleService', () => {
     }
   })
 
+  test('round-robins title requests across enabled provider keys', async () => {
+    const provider = await new ProviderService().addProvider({
+      presetId: 'custom',
+      name: 'Title Key Pool',
+      apiKey: '',
+      apiKeys: [
+        { id: 'title-key-a', apiKey: 'title-secret-a', enabled: true, weight: 1 },
+        { id: 'title-key-b', apiKey: 'title-secret-b', enabled: true, weight: 1 },
+      ],
+      loadBalancing: { strategy: 'round_robin' },
+      authStrategy: 'auth_token',
+      baseUrl: 'https://title-pool.invalid',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'title-main',
+        haiku: 'title-haiku',
+        sonnet: 'title-main',
+        opus: 'title-main',
+      },
+    })
+    const authorizations: Array<string | null> = []
+    globalThis.fetch = (async (_input, init) => {
+      authorizations.push(new Headers(init?.headers).get('authorization'))
+      return Response.json({
+        content: [{ type: 'text', text: '{"title":"Pool title"}' }],
+      })
+    }) as typeof fetch
+
+    await expect(generateTitle('Explain title key routing', provider.id)).resolves.toBe('Pool title')
+    await expect(generateTitle('Explain title key routing again', provider.id)).resolves.toBe('Pool title')
+
+    expect(authorizations).toEqual([
+      'Bearer title-secret-a',
+      'Bearer title-secret-b',
+    ])
+  })
+
+  test('fails over title requests to another provider key', async () => {
+    const provider = await new ProviderService().addProvider({
+      presetId: 'custom',
+      name: 'Title Key Failover',
+      apiKey: '',
+      apiKeys: [
+        { id: 'title-failover-a', apiKey: 'title-failover-secret-a', enabled: true, weight: 1 },
+        { id: 'title-failover-b', apiKey: 'title-failover-secret-b', enabled: true, weight: 1 },
+      ],
+      loadBalancing: { strategy: 'failover' },
+      authStrategy: 'auth_token',
+      baseUrl: 'https://title-failover.invalid',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'title-main',
+        haiku: 'title-haiku',
+        sonnet: 'title-main',
+        opus: 'title-main',
+      },
+    })
+    const authorizations: Array<string | null> = []
+    globalThis.fetch = (async (_input, init) => {
+      const authorization = new Headers(init?.headers).get('authorization')
+      authorizations.push(authorization)
+      if (authorization === 'Bearer title-failover-secret-a') {
+        return Response.json({ error: 'invalid key' }, { status: 401 })
+      }
+      return Response.json({
+        content: [{ type: 'text', text: '{"title":"Failover title"}' }],
+      })
+    }) as typeof fetch
+
+    await expect(generateTitle('Explain title failover', provider.id)).resolves.toBe('Failover title')
+
+    expect(authorizations).toEqual([
+      'Bearer title-failover-secret-a',
+      'Bearer title-failover-secret-b',
+    ])
+  })
+
   test('parses JSON title responses wrapped in markdown fences', () => {
     expect(parseGeneratedTitleText('```json\n{"title":"Write bash script"}\n```'))
       .toBe('Write bash script')

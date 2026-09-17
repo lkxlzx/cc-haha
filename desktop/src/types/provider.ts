@@ -11,6 +11,34 @@ export type ProviderAuthStrategy =
 
 export type ProviderRuntimeKind = 'anthropic_compatible' | 'openai_oauth' | 'grok_oauth'
 
+export type ProviderLoadBalancingStrategy =
+  | 'round_robin'
+  | 'weighted_round_robin'
+  | 'failover'
+
+export type ProviderCustomHeader = {
+  name: string
+  value: string
+}
+
+export type ProviderApiKey = {
+  id: string
+  label?: string
+  apiKey: string
+  proxyUrl?: string
+  customHeaders?: ProviderCustomHeader[]
+  enabled: boolean
+  weight: number
+}
+
+export type ProviderApiKeyInput = Omit<ProviderApiKey, 'id'> & {
+  id?: string
+}
+
+export type ProviderLoadBalancing = {
+  strategy: ProviderLoadBalancingStrategy
+}
+
 export type ModelMapping = {
   main: string
   fable?: string
@@ -27,6 +55,14 @@ export type Model1mSupport = {
 }
 
 export type ModelContextWindows = Record<string, number>
+
+export type ProviderCatalogModel = {
+  id: string
+  name?: string
+  contextWindow?: number
+  supports1m?: boolean
+  enabled?: boolean
+}
 
 export type ImageGenerationConfig = {
   model: string
@@ -50,12 +86,15 @@ export type SavedProvider = {
   presetId: string
   name: string
   apiKey: string  // masked from server
+  apiKeys?: ProviderApiKey[]
+  loadBalancing?: ProviderLoadBalancing
   authStrategy?: ProviderAuthStrategy
   baseUrl: string
   apiFormat: ApiFormat
   runtimeKind?: ProviderRuntimeKind
   models: ModelMapping
   model1mSupport?: Model1mSupport
+  modelCatalog?: ProviderCatalogModel[]
   autoCompactWindow?: number
   modelContextWindows?: ModelContextWindows
   toolSearchEnabled?: boolean
@@ -70,12 +109,15 @@ export type CreateProviderInput = {
   presetId: string
   name: string
   apiKey: string
+  apiKeys?: ProviderApiKeyInput[]
+  loadBalancing?: ProviderLoadBalancing
   authStrategy?: ProviderAuthStrategy
   baseUrl: string
   apiFormat?: ApiFormat
   runtimeKind?: ProviderRuntimeKind
   models: ModelMapping
   model1mSupport?: Model1mSupport
+  modelCatalog?: ProviderCatalogModel[]
   autoCompactWindow?: number
   modelContextWindows?: ModelContextWindows
   toolSearchEnabled?: boolean
@@ -89,12 +131,15 @@ export type CreateProviderInput = {
 export type UpdateProviderInput = {
   name?: string
   apiKey?: string
+  apiKeys?: ProviderApiKeyInput[] | null
+  loadBalancing?: ProviderLoadBalancing | null
   authStrategy?: ProviderAuthStrategy
   baseUrl?: string
   apiFormat?: ApiFormat
   runtimeKind?: ProviderRuntimeKind
   models?: ModelMapping
   model1mSupport?: Model1mSupport | null
+  modelCatalog?: ProviderCatalogModel[] | null
   autoCompactWindow?: number | null
   modelContextWindows?: ModelContextWindows | null
   toolSearchEnabled?: boolean
@@ -109,6 +154,8 @@ export type TestProviderConfigInput = {
   baseUrl: string
   apiKey: string
   modelId: string
+  proxyUrl?: string
+  customHeaders?: ProviderCustomHeader[]
   authStrategy?: ProviderAuthStrategy
   apiFormat?: ApiFormat
   supportsNestedToolResultMedia?: boolean

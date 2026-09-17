@@ -6,6 +6,22 @@ const WRITE_SETTINGS = new Set(['language', 'chatSendBehavior', 'alwaysThinkingE
 const RESERVED_PROVIDER_PATHS = new Set(['settings', 'cc-switch', 'test', 'models', 'presets', 'auth-status', 'official', 'reorder'])
 const REMOTE_COMPATIBILITY_KEYS = new Set(['maxOutputTokens', 'outputTokenLimit', 'outputTokenField', 'sampling', 'reasoning', 'parallelTools', 'structuredOutput'])
 
+function projectRemoteModelCatalog(catalog: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(catalog)) return []
+  return catalog.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
+    const model = entry as Record<string, unknown>
+    if (typeof model.id !== 'string' || !model.id.trim()) return []
+    return [{
+      id: model.id,
+      ...(typeof model.name === 'string' && { name: model.name }),
+      ...(typeof model.contextWindow === 'number' && { contextWindow: model.contextWindow }),
+      ...(typeof model.supports1m === 'boolean' && { supports1m: model.supports1m }),
+      ...(typeof model.enabled === 'boolean' && { enabled: model.enabled }),
+    }]
+  })
+}
+
 /** The browser replaces the fields it can edit, while hidden extensions stay on the desktop. */
 export function replaceRemoteCompatibility(current: RequestCompatibility | undefined, input: Record<string, unknown> | null) {
   const hidden = Object.fromEntries(Object.entries(current ?? {}).filter(([key]) => !REMOTE_COMPATIBILITY_KEYS.has(key)))
@@ -49,10 +65,25 @@ export function projectRemoteProvider(provider: SavedProvider) {
     'id', 'presetId', 'name', 'authStrategy', 'baseUrl', 'apiFormat', 'runtimeKind', 'models',
     'model1mSupport', 'autoCompactWindow', 'modelContextWindows', 'toolSearchEnabled',
     'disableExperimentalBetas', 'supportsNestedToolResultMedia', 'notes',
+    'loadBalancing',
   ] as const
   return {
     ...Object.fromEntries(publicKeys.filter(key => provider[key] !== undefined).map(key => [key, provider[key]])),
+    ...(provider.modelCatalog !== undefined && {
+      modelCatalog: projectRemoteModelCatalog(provider.modelCatalog),
+    }),
     apiKey: '',
+    apiKeys: (provider.apiKeys ?? (
+      provider.apiKey
+        ? [{ id: 'primary', apiKey: provider.apiKey, enabled: true, weight: 1 }]
+        : []
+    )).map((key) => ({
+      id: key.id,
+      ...(key.label !== undefined ? { label: key.label } : {}),
+      apiKey: '',
+      enabled: key.enabled,
+      weight: key.weight,
+    })),
     hasApiKey: !!provider.apiKey,
     ...(provider.requestCompatibility ? {
       requestCompatibility: Object.fromEntries([...REMOTE_COMPATIBILITY_KEYS].filter(key => provider.requestCompatibility![key] !== undefined).map(key => [key, provider.requestCompatibility![key]])),

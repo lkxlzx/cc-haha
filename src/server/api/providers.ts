@@ -14,6 +14,7 @@
  * DELETE /api/providers/:id              — delete a provider
  * POST   /api/providers/:id/activate     — activate a saved provider
  * POST   /api/providers/official         — activate official (clear env)
+ * POST   /api/providers/:id/keys/:keyId/test — test one saved key (own proxy)
  * POST   /api/providers/:id/test         — test a saved provider
  * POST   /api/providers/test             — test unsaved config
  */
@@ -132,6 +133,44 @@ export async function handleProvidersApi(
         return await handleCreate(req)
       }
       throw methodNotAllowed(req.method)
+    }
+
+    // POST /api/providers/:id/keys/:keyId/test — single saved key
+    if (action === 'keys' && segments[5] === 'test') {
+      if (req.method !== 'POST') throw methodNotAllowed(req.method)
+      const keyId = segments[4]
+      if (!keyId) throw ApiError.notFound('Missing key id')
+      let body: unknown
+      try {
+        body = await req.json()
+      } catch { /* no body is fine — uses saved values */ }
+      let overrides: { modelId?: string } | undefined
+      if (body && typeof body === 'object') {
+        const candidate = body as Record<string, unknown>
+        if (candidate.modelId !== undefined && typeof candidate.modelId !== 'string') {
+          throw ApiError.badRequest('modelId must be a string')
+        }
+        overrides = candidate.modelId === undefined
+          ? undefined
+          : { modelId: candidate.modelId as string }
+      }
+      const result = await providerService.testProviderKey(id, keyId, overrides)
+      if (!result.connectivity.success || result.proxy?.success === false) {
+        void diagnosticsService.recordEvent({
+          type: 'provider_test_failed',
+          severity: 'warn',
+          summary: result.connectivity.error || result.proxy?.error || 'Provider key test failed',
+          details: {
+            providerId: id,
+            keyId,
+            httpStatus: result.connectivity.httpStatus ?? result.proxy?.httpStatus,
+            modelId: overrides?.modelId,
+            connectivity: result.connectivity,
+            proxy: result.proxy,
+          },
+        })
+      }
+      return Response.json({ result })
     }
 
     // /api/providers/:id/activate

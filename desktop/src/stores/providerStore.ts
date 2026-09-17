@@ -16,7 +16,11 @@ import {
   GROK_OFFICIAL_PROVIDER_ID,
 } from '../constants/grokOfficialProvider'
 import { BUNDLED_PROVIDER_PRESETS } from '../config/providerPresets'
-import { resolveProviderRuntimeModelId, resolveProviderSlotModelId } from '../lib/runtimeSelection'
+import {
+  getProviderRuntimeModelIds,
+  resolveProviderRuntimeModelId,
+  resolveProviderSlotModelId,
+} from '../lib/runtimeSelection'
 import type {
   SavedProvider,
   CreateProviderInput,
@@ -48,6 +52,7 @@ type ProviderStore = {
   activateProvider: (id: string) => Promise<void>
   activateOfficial: () => Promise<void>
   testProvider: (id: string, overrides?: { modelId?: string }) => Promise<ProviderTestResult>
+  testKey: (id: string, keyId: string, overrides?: { modelId?: string }) => Promise<ProviderTestResult>
   testConfig: (input: TestProviderConfigInput) => Promise<ProviderTestResult>
   scanCcSwitch: () => Promise<CcSwitchScanResult>
   importCcSwitch: (sourceIds: string[]) => Promise<CcSwitchImportResult>
@@ -111,21 +116,13 @@ function mergeSavedOrderIntoProviderOrder(providerOrder: string[], savedOrder: s
   })
 }
 
-function providerModelIds(provider: SavedProvider): Set<string> {
-  return new Set(
-    (Object.keys(provider.models) as Array<keyof SavedProvider['models']>)
-      .map((slot) => resolveProviderSlotModelId(provider, slot))
-      .filter(Boolean),
-  )
-}
-
 function resolveRuntimeRefreshSelection(
   provider: SavedProvider,
   activeId: string | null,
   currentSelection: RuntimeSelection | undefined,
 ): RuntimeSelection | null {
   if (currentSelection?.providerId === provider.id) {
-    const modelIds = providerModelIds(provider)
+    const modelIds = getProviderRuntimeModelIds(provider)
     const modelId = resolveProviderRuntimeModelId(provider, currentSelection.modelId)
     return {
       providerId: provider.id,
@@ -303,6 +300,11 @@ export const useProviderStore = create<ProviderStore>((set, get) => ({
 
   testProvider: async (id, overrides?) => {
     const { result } = await providersApi.test(id, overrides)
+    return result
+  },
+
+  testKey: async (id, keyId, overrides?) => {
+    const { result } = await providersApi.testKey(id, keyId, overrides)
     return result
   },
 

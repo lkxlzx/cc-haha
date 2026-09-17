@@ -5223,6 +5223,41 @@ describe('chatStore history mapping', () => {
     expect(useSessionRuntimeStore.getState().selections[TEST_SESSION_ID]).toEqual(expectedSelection)
   })
 
+  it('replays an enabled catalog model as the exact runtime pointer', () => {
+    providerStoreSnapshot.providers = [{
+      id: 'provider-catalog',
+      presetId: 'custom',
+      name: 'Catalog Provider',
+      apiKey: 'fixture',
+      baseUrl: 'http://127.0.0.1:1',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'main-model',
+        haiku: 'fast-model',
+        sonnet: 'balanced-model',
+        opus: 'large-model',
+      },
+      modelCatalog: [{ id: 'catalog-model', enabled: true }],
+    }]
+    useSessionRuntimeStore.getState().setSelection(TEST_SESSION_ID, {
+      providerId: 'provider-catalog',
+      modelId: 'catalog-model',
+      effortLevel: 'high',
+    })
+
+    useChatStore.getState().connectToSession(TEST_SESSION_ID, {
+      prewarm: false,
+      minimalBootstrap: true,
+    })
+
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, {
+      type: 'set_runtime_config',
+      providerId: 'provider-catalog',
+      modelId: 'catalog-model',
+      effortLevel: 'high',
+    })
+  })
+
   it('pins current provider capabilities before sending an older implicit-default session', () => {
     providerStoreSnapshot.activeId = 'provider-1'
     providerStoreSnapshot.providers = [{

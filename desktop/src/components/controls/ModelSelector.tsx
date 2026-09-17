@@ -21,8 +21,10 @@ import { useDismissable } from '@/hooks/useDismissable'
 import { useMobileViewport } from '../../hooks/useMobileViewport'
 import { isDesktopRuntime } from '../../lib/desktopRuntime'
 import {
+  getEnabledProviderCatalogModels,
   normalizeRuntimeSelection,
   resolveDefaultRuntimeSelection,
+  resolveProviderCatalogModelRuntimeId,
   resolveProviderRuntimeModelId,
   resolveProviderSlotModelId,
 } from '../../lib/runtimeSelection'
@@ -139,24 +141,38 @@ function buildProviderModels(
   provider: SavedProvider,
   labels: Record<'main' | 'haiku' | 'sonnet' | 'opus', string>,
 ): ModelInfo[] {
-  const entries: Array<{ id: string; label: string }> = [
+  const entries: Array<{ id: string; label: string; contextWindow?: number }> = [
     { id: resolveProviderSlotModelId(provider, 'main'), label: labels.main },
     { id: resolveProviderSlotModelId(provider, 'haiku'), label: labels.haiku },
     { id: resolveProviderSlotModelId(provider, 'sonnet'), label: labels.sonnet },
     { id: resolveProviderSlotModelId(provider, 'opus'), label: labels.opus },
   ]
+  for (const model of getEnabledProviderCatalogModels(provider)) {
+    entries.push({
+      id: resolveProviderCatalogModelRuntimeId(model),
+      label: model.name ?? '',
+      ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+    })
+  }
 
-  const byId = new Map<string, { id: string; labels: string[] }>()
+  const byId = new Map<string, { id: string; labels: string[]; contextWindow?: number }>()
   for (const entry of entries) {
     if (!entry.id) continue
     const existing = byId.get(entry.id)
     if (existing) {
-      if (!existing.labels.includes(entry.label)) {
+      if (entry.label && !existing.labels.includes(entry.label)) {
         existing.labels.push(entry.label)
+      }
+      if (existing.contextWindow === undefined && entry.contextWindow !== undefined) {
+        existing.contextWindow = entry.contextWindow
       }
       continue
     }
-    byId.set(entry.id, { id: entry.id, labels: [entry.label] })
+    byId.set(entry.id, {
+      id: entry.id,
+      labels: entry.label ? [entry.label] : [],
+      ...(entry.contextWindow !== undefined ? { contextWindow: entry.contextWindow } : {}),
+    })
   }
 
   return [...byId.values()].map((entry) => {
@@ -170,7 +186,7 @@ function buildProviderModels(
       id: entry.id,
       name: entry.id,
       description: entry.labels.join(' · '),
-      context: '',
+      context: entry.contextWindow ? String(entry.contextWindow) : '',
       supportedReasoningEfforts: [...(reasoningProfile?.supportedReasoningEfforts ?? [])],
       ...(reasoningProfile?.defaultReasoningEffort
         ? { defaultReasoningEffort: reasoningProfile.defaultReasoningEffort }
@@ -285,6 +301,8 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   const ref = useRef<HTMLDivElement>(null)
   const effortButtonRef = useRef<HTMLButtonElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
+  const selectedOptionRef = useRef<HTMLButtonElement>(null)
+  const anchoredOnOpenRef = useRef(false)
   const requestedProvidersRef = useRef(false)
   const requestedOAuthStatusRef = useRef(false)
 
@@ -377,6 +395,21 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
     }
     updateDropdownPosition()
   }, [open, updateDropdownPosition])
+
+  // Open the list on the option that is already selected: with a long model
+  // list the current choice can be far below the fold, and re-anchoring on
+  // every open (not on model changes) keeps browsing from snapping back.
+  // The panel only mounts once dropdownPosition is measured, so anchor on
+  // that commit — once per open, via the ref flag.
+  useLayoutEffect(() => {
+    if (!open) {
+      anchoredOnOpenRef.current = false
+      return
+    }
+    if (!dropdownPosition || anchoredOnOpenRef.current) return
+    anchoredOnOpenRef.current = true
+    selectedOptionRef.current?.scrollIntoView?.({ block: 'nearest' })
+  }, [open, dropdownPosition])
 
   useEffect(() => {
     if (!open && searchQuery) setSearchQuery('')
@@ -671,6 +704,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
                     return (
                       <button
                         key={`${choice.providerId ?? 'official'}:${model.id}`}
+                        ref={isSelected ? selectedOptionRef : undefined}
                         onClick={() => {
                           const supportedEfforts = model.supportedReasoningEfforts
                           const explicitEffort = activeRuntimeSelection?.effortLevel
@@ -770,6 +804,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
                       : 'hover:bg-[var(--color-surface-hover)]'
                     }
                   `}
+                  ref={isSelected ? selectedOptionRef : undefined}
                 >
                   <div className="flex items-center gap-3">
                     <div className="min-w-0 flex-1">

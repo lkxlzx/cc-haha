@@ -68,6 +68,8 @@ export function editFileInEditor(filePath: string): EditorResult {
     const editorCommand = EDITOR_OVERRIDES[editor] ?? editor
     execSync_DEPRECATED(`${editorCommand} "${filePath}"`, {
       stdio: 'inherit',
+      // The editor is user-visible and may be a GUI application.
+      windowsHide: false,
     })
 
     // Read the edited content

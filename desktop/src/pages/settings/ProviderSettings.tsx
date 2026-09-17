@@ -17,7 +17,7 @@ import { Spinner } from '@/components/ui/Spinner'
 import { SettingsPageHeader, SettingsPill } from '@/components/settings/SettingsSection'
 import { Dropdown } from '@/components/ui/Dropdown'
 import { Tooltip } from '@/components/ui/Tooltip'
-import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ProviderAuthStrategy, ProviderModelInfo, ProviderModelsErrorCode } from '../../types/provider'
+import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ProviderAuthStrategy, ProviderCatalogModel, ProviderModelInfo, ProviderModelsErrorCode, ProviderLoadBalancingStrategy } from '../../types/provider'
 import { groupProviderModels, providerModelsErrorKey } from '../../lib/providerModels'
 import { apply1mSupportToContextInput, apply1mSupportToContextInputs, getAutoCompactWindowErrorKey, getModelContextWindowErrorKey, MODEL_SLOTS, parseAutoCompactWindowInput, parseModelContextWindowsInput, type ModelContextInputs, type ModelSlot } from '../../lib/providerModelContext'
 import type { ProviderPreset } from '../../types/providerPreset'
@@ -27,9 +27,11 @@ import { ChatGPTOfficialLogin } from '../../components/settings/ChatGPTOfficialL
 import { GrokOfficialLogin } from '../../components/settings/GrokOfficialLogin'
 import { CcSwitchImportModal } from '../../components/settings/CcSwitchImportModal'
 import { ModelIdCombobox } from '../../components/settings/ModelIdCombobox'
+import { ProviderModelCatalogEditor } from '../../components/settings/ProviderModelCatalogEditor'
 import { ProviderRequestCompatibilityFields } from '@/components/settings/ProviderRequestCompatibilityFields'
 import { compatibilityForm, invalidCompatibilityNumber, parseCompatibilityForm, readCompatibilityEditorJson, writeCompatibilityJson, type RequestCompatibilityForm } from '../../lib/providerRequestCompatibility'
 import { ProviderImageGenerationFields, type ImageGenerationFormValue } from '../../components/settings/ProviderImageGenerationFields'
+import { ProviderKeyPoolFields, createProviderKeyDraft, type ProviderKeyDraft } from './ProviderKeyPoolFields'
 import { BUILT_IN_PROVIDER_IDS, CLAUDE_OFFICIAL_PROVIDER_ID, OPENAI_OFFICIAL_PROVIDER_ID } from '../../constants/openaiOfficialProvider'
 import { GROK_OFFICIAL_PROVIDER_ID } from '../../constants/grokOfficialProvider'
 import { ApiError, getBaseUrl } from '../../api/client'
@@ -669,6 +671,16 @@ function buildModelContextWindows(
   return windows
 }
 
+function buildModelCatalogContextWindows(
+  modelCatalog: ProviderCatalogModel[],
+): Record<string, number> {
+  return Object.fromEntries(
+    modelCatalog
+      .filter((model) => model.enabled !== false && model.contextWindow !== undefined)
+      .map((model) => [model.id.trim(), model.contextWindow!]),
+  )
+}
+
 function hasModel1mMarker(model: string): boolean {
   return /\[1m\]$/i.test(model.trim()) || /:1m$/i.test(model.trim())
 }
@@ -922,8 +934,9 @@ function updateSettingsJsonModels(
 function providerNeedsProxy(
   apiFormat: ApiFormat,
   supportsNestedToolResultMedia: boolean,
+  hasMultipleApiKeys = false,
 ): boolean {
-  return apiFormat !== 'anthropic' || !supportsNestedToolResultMedia
+  return apiFormat !== 'anthropic' || !supportsNestedToolResultMedia || hasMultipleApiKeys
 }
 
 function updateSettingsJsonProviderConnection(
@@ -937,6 +950,7 @@ function updateSettingsJsonProviderConnection(
   toolSearchEnabled = false,
   disableExperimentalBetas = false,
   supportsNestedToolResultMedia = true,
+  hasMultipleApiKeys = false,
 ): string {
   try {
     const parsed = JSON.parse(raw || '{}') as { env?: Record<string, unknown> }
@@ -948,9 +962,9 @@ function updateSettingsJsonProviderConnection(
     delete env.ANTHROPIC_AUTH_TOKEN
     applyToolSearchEnv(env, apiFormat, toolSearchEnabled)
     applyDisableExperimentalBetasEnv(env, disableExperimentalBetas)
-    env.ANTHROPIC_BASE_URL = providerNeedsProxy(apiFormat, supportsNestedToolResultMedia) ? proxyBaseUrl : baseUrl
+    env.ANTHROPIC_BASE_URL = providerNeedsProxy(apiFormat, supportsNestedToolResultMedia, hasMultipleApiKeys) ? proxyBaseUrl : baseUrl
     Object.assign(env, buildSettingsJsonAuthEnv(
-      providerNeedsProxy(apiFormat, supportsNestedToolResultMedia),
+      providerNeedsProxy(apiFormat, supportsNestedToolResultMedia, hasMultipleApiKeys),
       authStrategy,
       apiKey,
       preset,
@@ -988,8 +1002,49 @@ function openExternalUrl(url: string) {
     .catch(() => window.open(url, '_blank', 'noopener,noreferrer'))
 }
 
+function initialProviderKeyDrafts(provider?: SavedProvider): ProviderKeyDraft[] {
+  if (provider?.apiKeys !== undefined) {
+    return provider.apiKeys.map((key) => ({ ...key }))
+  }
+  if (provider?.apiKey) {
+    return [{
+      id: 'primary',
+      apiKey: provider.apiKey,
+      enabled: true,
+      weight: 1,
+    }]
+  }
+  return provider ? [] : [createProviderKeyDraft()]
+}
+
+function hasMultipleEnabledProviderKeys(keys: ProviderKeyDraft[]): boolean {
+  return keys.filter((key) => key.enabled).length > 1
+}
+
+function firstEnabledProviderKeyValue(keys: ProviderKeyDraft[]): string {
+  return keys.find((key) => key.enabled && key.apiKey.trim())?.apiKey.trim()
+    ?? keys.find((key) => key.apiKey.trim())?.apiKey.trim()
+    ?? ''
+}
+
+function comparableProviderKeys(keys: ProviderKeyDraft[]) {
+  return keys.map((key) => ({
+    id: key.id,
+    label: key.label?.trim() ?? '',
+    apiKey: key.apiKey.trim(),
+    proxyUrl: key.proxyUrl?.trim() ?? '',
+    customHeaders: JSON.stringify(
+      (key.customHeaders ?? [])
+        .map((header) => [header.name.trim(), header.value.trim()])
+        .filter(([name]) => name),
+    ),
+    enabled: key.enabled,
+    weight: key.weight,
+  }))
+}
+
 function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode = false }: ProviderFormProps) {
-  const { createProvider, updateProvider, testConfig, fetchModels } = useProviderStore()
+  const { createProvider, updateProvider, testConfig, testKey, fetchModels } = useProviderStore()
   const fetchSettings = useSettingsStore((s) => s.fetchAll)
   const addToast = useUIStore((s) => s.addToast)
   const t = useTranslation()
@@ -1029,12 +1084,17 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? initialPreset.baseUrl)
   const [apiFormat, setApiFormat] = useState<ApiFormat>(provider?.apiFormat ?? initialPreset.apiFormat ?? 'anthropic')
   const [authStrategy, setAuthStrategy] = useState<ProviderAuthStrategy>(provider?.authStrategy ?? getPresetAuthStrategy(initialPreset))
-  const [apiKey, setApiKey] = useState(provider?.apiKey ?? '')
-  const [showApiKey, setShowApiKey] = useState(false)
+  const [apiKeys, setApiKeys] = useState<ProviderKeyDraft[]>(() => initialProviderKeyDrafts(provider))
+  const [loadBalancing, setLoadBalancing] = useState<ProviderLoadBalancingStrategy>(
+    provider?.loadBalancing?.strategy ?? 'round_robin',
+  )
   const [notes, setNotes] = useState(provider?.notes ?? '')
   const [compatibility, setCompatibility] = useState(() => compatibilityForm(provider?.requestCompatibility))
   const [models, setModels] = useState<ModelMapping>(initialModels)
   const [model1mSupport, setModel1mSupport] = useState<Model1mSupport>(initialModel1mSupport)
+  const [modelCatalog, setModelCatalog] = useState<ProviderCatalogModel[]>(
+    provider?.modelCatalog ?? [],
+  )
   const [modelContextInputs, setModelContextInputs] = useState<ModelContextInputs>(initialModelContextInputs)
   const [autoCompactWindow, setAutoCompactWindow] = useState(
     provider?.autoCompactWindow !== undefined
@@ -1057,6 +1117,8 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   const [credentialRequired, setCredentialRequired] = useState(false)
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null)
   const [isTesting, setIsTesting] = useState(false)
+  const [testingKeyId, setTestingKeyId] = useState<string | null>(null)
+  const [keyTestResults, setKeyTestResults] = useState<Record<string, 'success' | 'failed'>>({})
   const [fetchedModels, setFetchedModels] = useState<ProviderModelInfo[] | null>(null)
   const [modelsErrorCode, setModelsErrorCode] = useState<ProviderModelsErrorCode | null>(null)
   const [modelsErrorMessage, setModelsErrorMessage] = useState<string | null>(null)
@@ -1067,6 +1129,12 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   const jsonPastedRef = useRef(false)
   const settingsJsonUserEditedRef = useRef(false)
   const providerProxyBaseUrl = useMemo(() => getProviderProxyBaseUrl(), [])
+  const existingKeyIds = useMemo(
+    () => new Set((provider?.apiKeys ?? []).map((key) => key.id)),
+    [provider?.apiKeys],
+  )
+  const apiKey = firstEnabledProviderKeyValue(apiKeys)
+  const hasMultipleApiKeys = hasMultipleEnabledProviderKeys(apiKeys)
   const currentProviderSettings = {
     compatibility,
     selectedPreset,
@@ -1074,8 +1142,11 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
     apiFormat,
     authStrategy,
     apiKey,
+    apiKeys,
+    hasMultipleApiKeys,
     models,
     model1mSupport,
+    modelCatalog,
     modelContextInputs,
     autoCompactWindow,
     toolSearchEnabled,
@@ -1105,17 +1176,26 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           apiFormat,
           authStrategy,
           apiKey,
+          hasMultipleApiKeys,
           models,
           model1mSupport,
+          modelCatalog,
           modelContextInputs,
           autoCompactWindow,
           toolSearchEnabled,
           disableExperimentalBetas,
           supportsNestedToolResultMedia,
         } = providerSettingsRef.current
-        const needsProxy = providerNeedsProxy(apiFormat, supportsNestedToolResultMedia)
+        const needsProxy = providerNeedsProxy(
+          apiFormat,
+          supportsNestedToolResultMedia,
+          hasMultipleApiKeys,
+        )
         const autoCompactWindowEnv = autoCompactWindow.trim()
-        const modelContextWindows = buildModelContextWindows(models, modelContextInputs)
+        const modelContextWindows = {
+          ...buildModelCatalogContextWindows(modelCatalog),
+          ...buildModelContextWindows(models, modelContextInputs),
+        }
         const normalizedModels = normalizeModelMapping(models)
         const runtimeModels = applyModel1mSupportMapping(normalizedModels, model1mSupport)
         const existingEnv = (settings.env as Record<string, string>) || {}
@@ -1191,6 +1271,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
     )
     setModels(nextModels)
     setModel1mSupport(nextModel1mSupport)
+    setModelCatalog([])
     setModelContextInputs(nextModelContextInputs)
     setAutoCompactWindow(getPresetAutoCompactWindow(preset))
     setToolSearchEnabled(false)
@@ -1206,14 +1287,17 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   const autoCompactWindowErrorKey = getAutoCompactWindowErrorKey(autoCompactWindow)
   const modelContextWindowErrorSlots = MODEL_SLOTS.filter((slot) => getModelContextWindowErrorKey(modelContextInputs[slot]))
   const compatibilityInvalid = apiFormat !== 'anthropic' && (invalidCompatibilityNumber(compatibility.maxOutputTokens) || invalidCompatibilityNumber(compatibility.outputTokenLimit))
-  const canSubmit = !compatibilityInvalid && name.trim() && baseUrl.trim() && (mode === 'edit' || !requiresApiKey || apiKey.trim()) && models.main.trim() && (!imageGeneration.enabled || imageGeneration.model.trim()) && !settingsJsonError && !autoCompactWindowErrorKey && modelContextWindowErrorSlots.length === 0
+  const hasInvalidNewApiKey = apiKeys.some((key) =>
+    key.enabled &&
+    !key.apiKey.trim() &&
+    !existingKeyIds.has(key.id),
+  )
+  const canSubmit = !compatibilityInvalid && name.trim() && baseUrl.trim() && (mode === 'edit' || !requiresApiKey || apiKey.trim()) && !hasInvalidNewApiKey && models.main.trim() && (!imageGeneration.enabled || imageGeneration.model.trim()) && !settingsJsonError && !autoCompactWindowErrorKey && modelContextWindowErrorSlots.length === 0
   const normalizedBaseUrl = normalizeProviderBaseUrl(baseUrl)
   const isPresetDefaultEndpoint = normalizedBaseUrl === normalizeProviderBaseUrl(selectedPreset.baseUrl)
   const apiKeyUrl = isPresetDefaultEndpoint ? selectedPreset.apiKeyUrl?.trim() : undefined
   const promoText = isPresetDefaultEndpoint ? selectedPreset.promoText?.trim() : undefined
-  const displayedSettingsJson = showApiKey
-    ? settingsJson
-    : maskSettingsJsonSecrets(settingsJson)
+  const displayedSettingsJson = maskSettingsJsonSecrets(settingsJson)
   const regionalEndpointItems = (selectedPreset.regionalEndpoints ?? []).map((endpoint) => ({
     value: endpoint.baseUrl,
     label: endpoint.region === 'cn_zh'
@@ -1295,7 +1379,10 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   const toolSearchDescription = toolSearchUnsupported
     ? t('settings.providers.toolSearchUnsupported')
     : t('settings.providers.toolSearchDesc')
-  const configuredContextWindows = buildModelContextWindows(models, modelContextInputs)
+  const configuredContextWindows = {
+    ...buildModelCatalogContextWindows(modelCatalog),
+    ...buildModelContextWindows(models, modelContextInputs),
+  }
   const configuredContextSummary = Object.entries(configuredContextWindows)
     .filter(([model], index, entries) => entries.findIndex(([candidate]) => candidate === model) === index)
     .map(([model, value]) => `${model}: ${formatContextWindow(value)}`)
@@ -1315,11 +1402,25 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   }
   const handleBaseUrlChange = (value: string) => {
     setBaseUrl(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, apiKey, selectedPreset, value, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas, supportsNestedToolResultMedia))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, apiKey, selectedPreset, value, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas, supportsNestedToolResultMedia, hasMultipleApiKeys))
   }
-  const handleApiKeyChange = (value: string) => {
-    setApiKey(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, value, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas, supportsNestedToolResultMedia))
+  const handleApiKeysChange = (keys: ProviderKeyDraft[]) => {
+    setApiKeys(keys)
+    const nextApiKey = firstEnabledProviderKeyValue(keys)
+    const nextHasMultipleApiKeys = hasMultipleEnabledProviderKeys(keys)
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(
+      current,
+      apiFormat,
+      authStrategy,
+      nextApiKey,
+      selectedPreset,
+      baseUrl,
+      providerProxyBaseUrl,
+      toolSearchEnabled,
+      disableExperimentalBetas,
+      supportsNestedToolResultMedia,
+      nextHasMultipleApiKeys,
+    ))
   }
   const handleCompatibilityChange = (value: RequestCompatibilityForm) => {
     setCompatibility(value)
@@ -1335,7 +1436,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   const handleApiFormatChange = (value: ApiFormat) => {
     setApiFormat(value)
     setSettingsJson((current) => {
-      const connected = updateSettingsJsonProviderConnection(current, value, authStrategy, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas, supportsNestedToolResultMedia)
+      const connected = updateSettingsJsonProviderConnection(current, value, authStrategy, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas, supportsNestedToolResultMedia, hasMultipleApiKeys)
       try {
         return JSON.stringify(writeCompatibilityJson(JSON.parse(connected), value === 'anthropic' ? undefined : parseCompatibilityForm(compatibility)), null, 2)
       } catch {
@@ -1345,7 +1446,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   }
   const handleAuthStrategyChange = (value: ProviderAuthStrategy) => {
     setAuthStrategy(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, value, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas, supportsNestedToolResultMedia))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, value, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas, supportsNestedToolResultMedia, hasMultipleApiKeys))
   }
   const handleNestedToolResultMediaToggle = (enabled: boolean) => {
     if (nestedToolResultMediaUnsupported) return
@@ -1361,6 +1462,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
       toolSearchEnabled,
       disableExperimentalBetas,
       enabled,
+      hasMultipleApiKeys,
     ))
   }
 
@@ -1435,6 +1537,16 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
       buildModelContextWindows(models, nextInputs),
     ))
   }
+  const handleModelCatalogChange = (nextModelCatalog: ProviderCatalogModel[]) => {
+    setModelCatalog(nextModelCatalog)
+    setSettingsJson((current) => updateSettingsJsonModelContextWindows(
+      current,
+      {
+        ...buildModelCatalogContextWindows(nextModelCatalog),
+        ...buildModelContextWindows(models, modelContextInputs),
+      },
+    ))
+  }
   const hasModelsBaseUrl = Boolean(baseUrl.trim())
   const hasModelsApiKey = Boolean(apiKey.trim())
   const canFetchModels = hasModelsBaseUrl && hasModelsApiKey
@@ -1486,6 +1598,36 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   const modelsErrorUpstream = modelsErrorMessage && modelsErrorMessage !== modelsErrorText
     ? modelsErrorMessage
     : null
+  const modelFetchFeedback = browserMode ? null : !hasModelsApiKey ? (
+    <p className="text-[11px] text-[var(--color-text-tertiary)]">
+      {t('settings.providers.fetchModelsApiKeyHint')}
+    </p>
+  ) : !hasModelsBaseUrl ? (
+    <p className="text-[11px] text-[var(--color-text-tertiary)]">
+      {t('settings.providers.fetchModelsHint')}
+    </p>
+  ) : modelsErrorCode ? (
+    <div role="alert" className="flex flex-col gap-0.5">
+      <p className="text-[11px] text-[var(--color-error)]">{modelsErrorText}</p>
+      {modelsErrorUpstream && (
+        <p className="break-words text-[11px] text-[var(--color-text-tertiary)]">
+          {t('settings.providers.fetchModelsErrorUpstream')} {modelsErrorUpstream}
+        </p>
+      )}
+    </div>
+  ) : fetchedModels && fetchedModels.length === 0 ? (
+    <p className="text-[11px] text-[var(--color-text-tertiary)]">
+      {t('settings.providers.fetchModelsEmpty')}
+    </p>
+  ) : fetchedModels ? (
+    <p className="text-[11px] text-[var(--color-text-secondary)]">
+      {t('settings.providers.fetchModelsLoaded', { count: fetchedModels.length })}
+    </p>
+  ) : (
+    <p className="text-[11px] text-[var(--color-text-tertiary)]">
+      {t('settings.providers.fetchModelsSupportHint')}
+    </p>
+  )
   const modelPickerGroups = useMemo(
     () => groupProviderModels(
       fetchedModels ?? [],
@@ -1509,7 +1651,22 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
     const storedCompatibility = apiFormat === 'anthropic' ? undefined : parseCompatibilityForm(compatibility)
     const normalizedModels = normalizeModelMapping(models)
     const parsedAutoCompactWindow = parseAutoCompactWindowInput(autoCompactWindow)
-    const parsedModelContextWindows = buildModelContextWindows(models, modelContextInputs)
+    const parsedModelContextWindows = {
+      ...buildModelCatalogContextWindows(modelCatalog),
+      ...buildModelContextWindows(models, modelContextInputs),
+    }
+    const storedModelCatalog = modelCatalog.flatMap((model) => {
+      const id = model.id.trim()
+      if (!id) return []
+      const name = model.name?.trim()
+      return [{
+        id,
+        ...(name ? { name } : {}),
+        ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+        ...(model.supports1m !== undefined ? { supports1m: model.supports1m } : {}),
+        ...(model.enabled !== undefined ? { enabled: model.enabled } : {}),
+      }]
+    })
     const storedModel1mSupport = hasAnyModel1mSupport(model1mSupport)
       ? model1mSupport
       : undefined
@@ -1520,6 +1677,29 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           ...(imageGeneration.apiKey.trim() ? { apiKey: imageGeneration.apiKey.trim() } : {}),
         }
       : undefined
+    const storedApiKeys = apiKeys
+      .filter((key) => key.apiKey.trim() || existingKeyIds.has(key.id))
+      .map((key) => {
+        const label = key.label?.trim()
+        const proxyUrl = key.proxyUrl?.trim()
+        const customHeaders = (key.customHeaders ?? [])
+          .map((header) => ({ name: header.name.trim(), value: header.value.trim() }))
+          .filter((header) => header.name)
+        return {
+          id: key.id,
+          ...(label ? { label } : {}),
+          apiKey: key.apiKey.trim(),
+          // Always send the field so an explicit blank clears a saved proxy;
+          // the server keeps the saved one only when the field is omitted.
+          proxyUrl: proxyUrl ?? '',
+          // Headers are only sent when non-empty: an omitted field keeps the
+          // saved headers server-side (the desktop always re-sends every key,
+          // so sending an empty array here would wipe previously saved ones).
+          ...(customHeaders.length > 0 ? { customHeaders } : {}),
+          enabled: key.enabled,
+          weight: Math.min(1000, Math.max(1, Math.trunc(key.weight ?? 1))),
+        }
+      })
     setIsSubmitting(true)
     setSaveFailed(false)
     setCredentialRequired(false)
@@ -1543,12 +1723,17 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           presetId: selectedPreset.id,
           name: name.trim(),
           apiKey: apiKey.trim(),
+          ...(storedApiKeys.length > 0 && {
+            apiKeys: storedApiKeys,
+            loadBalancing: { strategy: loadBalancing },
+          }),
           authStrategy,
           baseUrl: baseUrl.trim(),
           apiFormat,
           ...(storedCompatibility ? { requestCompatibility: storedCompatibility } : {}),
           models: normalizedModels,
           ...(storedModel1mSupport !== undefined && { model1mSupport: storedModel1mSupport }),
+          ...(storedModelCatalog.length > 0 && { modelCatalog: storedModelCatalog }),
           ...(parsedAutoCompactWindow !== undefined && { autoCompactWindow: parsedAutoCompactWindow }),
           ...(Object.keys(parsedModelContextWindows).length > 0 && { modelContextWindows: parsedModelContextWindows }),
           toolSearchEnabled,
@@ -1566,6 +1751,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           requestCompatibility: storedCompatibility ?? null,
           models: normalizedModels,
           model1mSupport: storedModel1mSupport ?? null,
+          modelCatalog: storedModelCatalog.length > 0 ? storedModelCatalog : null,
           autoCompactWindow: parsedAutoCompactWindow ?? null,
           modelContextWindows: Object.keys(parsedModelContextWindows).length > 0
             ? parsedModelContextWindows
@@ -1573,10 +1759,11 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           toolSearchEnabled,
           disableExperimentalBetas,
           supportsNestedToolResultMedia,
+          apiKeys: storedApiKeys,
+          loadBalancing: { strategy: loadBalancing },
           imageGeneration: storedImageGeneration ?? null,
           notes: notes.trim() || undefined,
         }
-        if (apiKey.trim()) input.apiKey = apiKey.trim()
         await updateProvider(provider.id, input)
       }
       await fetchSettings()
@@ -1586,6 +1773,14 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
         !!error.body && typeof error.body === 'object' && 'code' in error.body &&
         error.body.code === 'REMOTE_PROVIDER_CREDENTIAL_REQUIRED')
       setSaveFailed(true)
+      addToast({
+        type: 'error',
+        message: error instanceof ApiError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : t('publicAccess.genericError'),
+      })
     } finally {
       setIsSubmitting(false)
     }
@@ -1602,10 +1797,13 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
     setTestResult(null)
     try {
       let result: ProviderTestResult
-      const savedConfigUnchanged = mode === 'edit' && provider && !apiKey.trim() &&
+      const savedKeys = provider ? initialProviderKeyDrafts(provider) : []
+      const savedConfigUnchanged = mode === 'edit' && provider &&
         baseUrl.trim() === provider.baseUrl.trim() &&
         apiFormat === provider.apiFormat &&
         authStrategy === provider.authStrategy &&
+        JSON.stringify(comparableProviderKeys(apiKeys)) === JSON.stringify(comparableProviderKeys(savedKeys)) &&
+        loadBalancing === (provider.loadBalancing?.strategy ?? 'round_robin') &&
         supportsNestedToolResultMedia === (provider.supportsNestedToolResultMedia ?? true) &&
         JSON.stringify(parseCompatibilityForm(compatibility)) === JSON.stringify(provider.requestCompatibility)
       if (savedConfigUnchanged && provider) {
@@ -1614,9 +1812,19 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
         })
       } else {
         if (requiresApiKey && !apiKey.trim()) return
+        // The main "Test connection" button tests with the first enabled key's
+        // proxy and custom headers, mirroring the per-key test path.
+        const leadKey = apiKeys.find((entry) => entry.enabled && entry.apiKey.trim())
+          ?? apiKeys.find((entry) => entry.apiKey.trim())
+        const leadProxyUrl = leadKey?.proxyUrl?.trim()
+        const leadCustomHeaders = (leadKey?.customHeaders ?? [])
+          .map((header) => ({ name: header.name.trim(), value: header.value.trim() }))
+          .filter((header) => header.name)
         result = await testConfig({
           baseUrl: baseUrl.trim(),
-          apiKey: apiKey.trim() || selectedPreset.defaultEnv?.ANTHROPIC_AUTH_TOKEN || 'local',
+          apiKey: leadKey?.apiKey.trim() || apiKey.trim() || selectedPreset.defaultEnv?.ANTHROPIC_AUTH_TOKEN || 'local',
+          ...(leadProxyUrl ? { proxyUrl: leadProxyUrl } : {}),
+          ...(leadCustomHeaders.length > 0 ? { customHeaders: leadCustomHeaders } : {}),
           modelId: models.main.trim(),
           authStrategy,
           apiFormat,
@@ -1629,6 +1837,89 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
       setTestResult({ connectivity: { success: false, latencyMs: 0, error: t('settings.providers.requestFailed') } })
     } finally {
       setIsTesting(false)
+    }
+  }
+
+  const handleTestKey = async (key: ProviderKeyDraft) => {
+    if (testingKeyId) return
+    const keyIndex = apiKeys.findIndex((entry) => entry.id === key.id) + 1
+    const proxyUrl = key.proxyUrl?.trim()
+    const notify = (result: ProviderTestResult) => {
+      setKeyTestResults((current) => ({
+        ...current,
+        [key.id]: result.connectivity.success ? 'success' : 'failed',
+      }))
+      addToast(result.connectivity.success
+        ? {
+          type: 'success',
+          message: t('settings.providers.apiKeyTestSuccess', {
+            index: String(keyIndex),
+            latency: String(result.connectivity.latencyMs),
+          }),
+        }
+        : {
+          type: 'error',
+          message: t('settings.providers.apiKeyTestFailed', {
+            index: String(keyIndex),
+            error: result.connectivity.error || '',
+          }),
+        })
+    }
+    const normalizeHeaders = (headers?: { name: string; value: string }[]) =>
+      JSON.stringify((headers ?? []).map((h) => [h.name.trim(), h.value.trim()]))
+    // A saved key whose secret, proxy and headers are untouched goes through
+    // its own endpoint (server-side real values + proxy + headers); new or
+    // edited keys are tested with exactly what's in the form right now.
+    const savedKey = mode === 'edit' && provider
+      ? provider.apiKeys?.find((entry) => entry.id === key.id)
+      : undefined
+    if (!savedKey && !key.apiKey.trim()) return
+    if (provider && savedKey && !key.apiKey.trim() && (savedKey.proxyUrl ?? '') === (proxyUrl ?? '')
+      && normalizeHeaders(savedKey.customHeaders) === normalizeHeaders(key.customHeaders)) {
+      setTestingKeyId(key.id)
+      try {
+        notify(await testKey(provider.id, key.id, { modelId: models.main.trim() }))
+      } catch {
+        setKeyTestResults((current) => ({ ...current, [key.id]: 'failed' }))
+        addToast({
+          type: 'error',
+          message: t('settings.providers.apiKeyTestFailed', {
+            index: String(keyIndex),
+            error: t('settings.providers.requestFailed'),
+          }),
+        })
+      } finally {
+        setTestingKeyId(null)
+      }
+      return
+    }
+    setTestingKeyId(key.id)
+    try {
+      const customHeaders = (key.customHeaders ?? [])
+        .map((header) => ({ name: header.name.trim(), value: header.value.trim() }))
+        .filter((header) => header.name)
+      notify(await testConfig({
+        baseUrl: baseUrl.trim(),
+        apiKey: key.apiKey.trim(),
+        ...(proxyUrl ? { proxyUrl } : {}),
+        ...(customHeaders.length > 0 ? { customHeaders } : {}),
+        modelId: models.main.trim(),
+        authStrategy,
+        apiFormat,
+        supportsNestedToolResultMedia,
+        ...(apiFormat !== 'anthropic' ? { requestCompatibility: parseCompatibilityForm(compatibility) } : {}),
+      }))
+    } catch {
+      setKeyTestResults((current) => ({ ...current, [key.id]: 'failed' }))
+      addToast({
+        type: 'error',
+        message: t('settings.providers.apiKeyTestFailed', {
+          index: String(keyIndex),
+          error: t('settings.providers.requestFailed'),
+        }),
+      })
+    } finally {
+      setTestingKeyId(null)
     }
   }
 
@@ -1828,33 +2119,17 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           </div>
         </label>
 
-        <div className="flex flex-col gap-1">
-          <label htmlFor="provider-api-key" className="text-sm font-medium text-[var(--color-text-primary)]">
-            {t('settings.providers.apiKey')}
-            {mode === 'create' && requiresApiKey && <span className="text-[var(--color-error)] ml-0.5">*</span>}
-          </label>
-          <div className="relative">
-            <input
-              id="provider-api-key"
-              autoComplete="off"
-              spellCheck={false}
-              type={showApiKey ? 'text' : 'password'}
-              value={apiKey}
-              onChange={(e) => handleApiKeyChange(e.target.value)}
-              placeholder="sk-..."
-              className="h-10 w-full rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 pr-10 text-sm text-[var(--color-text-primary)] outline-none transition-colors duration-150 placeholder:text-[var(--color-text-tertiary)] focus:border-[var(--color-border-focus)] focus:shadow-[var(--shadow-focus-ring)]"
-            />
-            <IconButton
-              icon={showApiKey ? 'visibility_off' : 'visibility'}
-              label={t(showApiKey ? 'settings.providers.hideApiKey' : 'settings.providers.showApiKey')}
-              showTooltip={false}
-              size="sm"
-              tone="muted"
-              onClick={() => setShowApiKey((visible) => !visible)}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2"
-            />
-          </div>
-        </div>
+        <ProviderKeyPoolFields
+          value={apiKeys}
+          onChange={handleApiKeysChange}
+          strategy={loadBalancing}
+          onStrategyChange={setLoadBalancing}
+          requiresApiKey={mode === 'create' && requiresApiKey}
+          existingKeyIds={existingKeyIds}
+          onTestKey={browserMode ? undefined : handleTestKey}
+          testingKeyId={testingKeyId}
+          testResults={keyTestResults}
+        />
 
         {(apiKeyUrl || promoText) && (
           <div className="-mt-2 flex flex-col gap-1.5">
@@ -1893,41 +2168,9 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
 
         {/* Model Mapping */}
         <div>
-          <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="mb-2">
             <label className="text-sm font-medium text-[var(--color-text-primary)]">{t('settings.providers.modelMapping')}</label>
-            {!browserMode && <Button
-              variant="secondary"
-              size="base"
-              onClick={handleFetchModels}
-              disabled={!canFetchModels}
-              loading={isFetchingModels}
-              icon={<span className="material-symbols-outlined text-[15px]">cloud_download</span>}
-            >
-              {t('settings.providers.fetchModels')}
-            </Button>}
           </div>
-          {browserMode ? null : !hasModelsApiKey ? (
-            <p className="mb-2 text-[11px] text-[var(--color-text-tertiary)]">{t('settings.providers.fetchModelsApiKeyHint')}</p>
-          ) : !hasModelsBaseUrl ? (
-            <p className="mb-2 text-[11px] text-[var(--color-text-tertiary)]">{t('settings.providers.fetchModelsHint')}</p>
-          ) : modelsErrorCode ? (
-            <div role="alert" className="mb-2 flex flex-col gap-0.5">
-              <p className="text-[11px] text-[var(--color-error)]">{modelsErrorText}</p>
-              {modelsErrorUpstream && (
-                <p className="break-words text-[11px] text-[var(--color-text-tertiary)]">
-                  {t('settings.providers.fetchModelsErrorUpstream')} {modelsErrorUpstream}
-                </p>
-              )}
-            </div>
-          ) : fetchedModels && fetchedModels.length === 0 ? (
-            <p className="mb-2 text-[11px] text-[var(--color-text-tertiary)]">{t('settings.providers.fetchModelsEmpty')}</p>
-          ) : fetchedModels ? (
-            <p className="mb-2 text-[11px] text-[var(--color-text-secondary)]">
-              {t('settings.providers.fetchModelsLoaded', { count: fetchedModels.length })}
-            </p>
-          ) : (
-            <p className="mb-2 text-[11px] text-[var(--color-text-tertiary)]">{t('settings.providers.fetchModelsSupportHint')}</p>
-          )}
           <div className={browserMode ? "grid grid-cols-1 sm:grid-cols-2 gap-2" : "grid grid-cols-2 gap-2"}>
             {MODEL_SLOTS.map((slot) => {
               const labelKey = slot === 'main'
@@ -1972,6 +2215,18 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
             {t('settings.providers.model1mSupportHint')}
           </p>
         </div>
+
+        <ProviderModelCatalogEditor
+          value={modelCatalog}
+          onChange={handleModelCatalogChange}
+          slotModels={models}
+          modelPickerGroups={modelPickerGroups}
+          fetchedModels={fetchedModels}
+          onFetchModels={browserMode ? undefined : handleFetchModels}
+          canFetchModels={canFetchModels}
+          isFetchingModels={isFetchingModels}
+          fetchFeedback={modelFetchFeedback}
+        />
 
         <div className="rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)]">
           <button
@@ -2124,7 +2379,10 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
                   }
                   const nextApiKey = env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY
                   if (nextApiKey && nextApiKey !== '(your API key)' && nextApiKey !== API_KEY_JSON_PLACEHOLDER) {
-                    setApiKey(nextApiKey)
+                    setApiKeys((current) => current.length > 0
+                      ? current.map((key, index) =>
+                          index === 0 ? { ...key, apiKey: nextApiKey, enabled: true } : key)
+                      : [{ ...createProviderKeyDraft(), apiKey: nextApiKey }])
                   }
                   const nextAuthStrategy = inferAuthStrategyFromEnv(env)
                   if (nextAuthStrategy) {

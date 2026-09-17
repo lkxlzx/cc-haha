@@ -297,6 +297,162 @@ describe('ProviderService', () => {
       expect(provider.models.main).toBe('model-main')
     })
 
+    test('persists a multi-key pool and its load-balancing strategy', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        apiKey: '',
+        apiKeys: [
+          { id: 'primary', label: 'Primary', apiKey: 'sk-primary', enabled: true, weight: 2 },
+          { id: 'backup', apiKey: 'sk-backup', enabled: false, weight: 1 },
+        ],
+        loadBalancing: { strategy: 'weighted_round_robin' },
+      }))
+
+      expect(provider.apiKey).toBe('sk-primary')
+      expect(provider.apiKeys).toEqual([
+        { id: 'primary', label: 'Primary', apiKey: 'sk-primary', enabled: true, weight: 2 },
+        { id: 'backup', apiKey: 'sk-backup', enabled: false, weight: 1 },
+      ])
+      expect(provider.loadBalancing).toEqual({ strategy: 'weighted_round_robin' })
+
+      const config = await readProvidersConfig()
+      expect((config.providers as Array<Record<string, unknown>>)[0]?.apiKeys).toEqual(provider.apiKeys)
+      expect((config.providers as Array<Record<string, unknown>>)[0]?.loadBalancing).toEqual(provider.loadBalancing)
+    })
+
+    test('persists a per-key proxy and preserves it across edits', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        apiKey: '',
+        apiKeys: [
+          {
+            id: 'key-a',
+            apiKey: 'sk-a',
+            proxyUrl: 'socks5://user:pass@127.0.0.1:1080',
+            enabled: true,
+            weight: 1,
+          },
+          { id: 'key-b', apiKey: 'sk-b', proxyUrl: '  ', enabled: true, weight: 1 },
+        ],
+      }))
+
+      expect(provider.apiKeys).toEqual([
+        { id: 'key-a', apiKey: 'sk-a', proxyUrl: 'socks5://user:pass@127.0.0.1:1080', enabled: true, weight: 1 },
+        { id: 'key-b', apiKey: 'sk-b', enabled: true, weight: 1 },
+      ])
+
+      // Omitting proxyUrl (e.g. remote edits) keeps the saved proxy.
+      const kept = await svc.updateProvider(provider.id, {
+        apiKeys: [
+          { id: 'key-a', apiKey: '', enabled: true, weight: 1 },
+        ],
+      })
+      expect(kept.apiKeys?.[0]?.proxyUrl).toBe('socks5://user:pass@127.0.0.1:1080')
+
+      // An explicit replacement overwrites the saved proxy.
+      const replaced = await svc.updateProvider(provider.id, {
+        apiKeys: [
+          { id: 'key-a', apiKey: '', proxyUrl: 'http://proxy.example:8080', enabled: true, weight: 1 },
+        ],
+      })
+      expect(replaced.apiKeys?.[0]?.proxyUrl).toBe('http://proxy.example:8080')
+
+      // Explicitly blanking the proxy removes the field.
+      const cleared = await svc.updateProvider(provider.id, {
+        apiKeys: [
+          { id: 'key-a', apiKey: '', proxyUrl: '', enabled: true, weight: 1 },
+        ],
+      })
+      expect(cleared.apiKeys?.[0]?.proxyUrl).toBeUndefined()
+    })
+
+    test('persists per-key custom headers and preserves them across edits', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        apiKey: '',
+        apiKeys: [
+          {
+            id: 'key-a',
+            apiKey: 'sk-a',
+            customHeaders: [{ name: 'X-Tenant', value: 'acme' }],
+            enabled: true,
+            weight: 1,
+          },
+          { id: 'key-b', apiKey: 'sk-b', customHeaders: [{ name: ' bad name ', value: 'x' }], enabled: true, weight: 1 },
+        ],
+      }))
+
+      expect(provider.apiKeys?.[0]?.customHeaders).toEqual([{ name: 'X-Tenant', value: 'acme' }])
+      // Invalid header names are dropped at the schema boundary.
+      expect(provider.apiKeys?.[1]?.customHeaders).toBeUndefined()
+
+      // Omitting customHeaders (e.g. remote edits) keeps the saved headers.
+      const kept = await svc.updateProvider(provider.id, {
+        apiKeys: [
+          { id: 'key-a', apiKey: '', enabled: true, weight: 1 },
+        ],
+      })
+      expect(kept.apiKeys?.[0]?.customHeaders).toEqual([{ name: 'X-Tenant', value: 'acme' }])
+
+      // An explicit replacement overwrites the saved headers.
+      const replaced = await svc.updateProvider(provider.id, {
+        apiKeys: [
+          {
+            id: 'key-a',
+            apiKey: '',
+            customHeaders: [
+              { name: 'X-Trace', value: 'on' },
+              { name: 'x-trace', value: 'off' },
+              { name: 'X-Empty', value: '' },
+            ],
+            enabled: true,
+            weight: 1,
+          },
+        ],
+      })
+      // Case-insensitive dedupe keeps the last occurrence as-is; empty values survive.
+      expect(replaced.apiKeys?.[0]?.customHeaders).toEqual([
+        { name: 'x-trace', value: 'off' },
+        { name: 'X-Empty', value: '' },
+      ])
+
+      // An explicit empty array clears the saved headers.
+      const cleared = await svc.updateProvider(provider.id, {
+        apiKeys: [
+          { id: 'key-a', apiKey: '', customHeaders: [], enabled: true, weight: 1 },
+        ],
+      })
+      expect(cleared.apiKeys?.[0]?.customHeaders).toBeUndefined()
+    })
+
+    test('should persist the provider model catalog', async () => {
+      const svc = new ProviderService()
+      const modelCatalog = [
+        {
+          id: 'catalog-model',
+          name: 'Catalog Model',
+          contextWindow: 320000,
+          supports1m: false,
+          enabled: true,
+        },
+        {
+          id: 'long-context-model',
+          supports1m: true,
+          enabled: false,
+        },
+      ]
+      const provider = await svc.addProvider(sampleInput({ modelCatalog }))
+
+      expect(provider.modelCatalog).toEqual(modelCatalog)
+      const config = await readProvidersConfig()
+      expect(
+        (config.providers as Array<{ modelCatalog?: unknown }>)[0]?.modelCatalog,
+      ).toEqual(modelCatalog)
+
+      const { providers } = await svc.listProviders()
+      expect(providers[0]?.modelCatalog).toEqual(modelCatalog)
+    })
+
     test('should normalize empty model mappings to the main model when adding a provider', async () => {
       const svc = new ProviderService()
       const provider = await svc.addProvider(sampleInput({
@@ -333,6 +489,26 @@ describe('ProviderService', () => {
       await svc.addProvider(sampleInput())
 
       await expect(fs.readFile(path.join(tmpDir, 'cc-haha', 'settings.json'), 'utf-8')).rejects.toThrow()
+    })
+
+    test('activating a provider with multiple enabled keys routes CLI traffic through the key pool proxy', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        apiKey: '',
+        apiKeys: [
+          { id: 'key-1', apiKey: 'secret-1', enabled: true, weight: 1 },
+          { id: 'key-2', apiKey: 'secret-2', enabled: true, weight: 1 },
+        ],
+        loadBalancing: { strategy: 'round_robin' },
+      }))
+
+      await svc.activateProvider(provider.id)
+
+      const settings = await readSettings()
+      const env = settings.env as Record<string, string>
+      expect(env.ANTHROPIC_BASE_URL).toContain('/proxy')
+      expect(env.ANTHROPIC_API_KEY).toBe('proxy-managed')
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
     })
 
     test('custom providers keep thinking compatibility without narrowing CLI effort', async () => {
@@ -822,6 +998,76 @@ describe('ProviderService', () => {
       expect(updated.baseUrl).toBe('https://new-api.example.com')
       // unchanged fields preserved
       expect(updated.apiKey).toBe('sk-test-key-123')
+    })
+
+    test('merges redacted keys by id and ignores duplicate requested ids', async () => {
+      const svc = new ProviderService()
+      const added = await svc.addProvider(sampleInput({
+        apiKey: '',
+        apiKeys: [
+          { id: 'key-1', apiKey: 'secret-1', enabled: true, weight: 1 },
+          { id: 'key-2', apiKey: 'secret-2', enabled: true, weight: 1 },
+        ],
+      }))
+
+      const updated = await svc.updateProvider(added.id, {
+        apiKeys: [
+          { id: 'key-1', label: 'Renamed', apiKey: '', enabled: true, weight: 3 },
+          { id: 'key-1', apiKey: '', enabled: true, weight: 1 },
+          { id: 'key-2', apiKey: 'secret-2-rotated', enabled: true, weight: 1 },
+        ],
+        loadBalancing: { strategy: 'failover' },
+      })
+
+      expect(updated.apiKeys).toEqual([
+        { id: 'key-1', label: 'Renamed', apiKey: 'secret-1', enabled: true, weight: 3 },
+        { id: 'key-2', apiKey: 'secret-2-rotated', enabled: true, weight: 1 },
+      ])
+      expect(updated.apiKey).toBe('secret-1')
+      expect(updated.loadBalancing).toEqual({ strategy: 'failover' })
+    })
+
+    test('does not fall back to a preset key when every configured key is disabled', async () => {
+      const svc = new ProviderService()
+      const added = await svc.addProvider(sampleInput({
+        presetId: 'lmstudio',
+        apiKey: '',
+        apiKeys: [
+          { id: 'disabled', apiKey: 'configured-secret', enabled: false, weight: 1 },
+        ],
+        supportsNestedToolResultMedia: false,
+      }))
+
+      const proxyConfig = await svc.getProviderForProxy(added.id)
+
+      expect(proxyConfig?.apiKey).toBe('')
+      expect(proxyConfig?.apiKeys).toEqual([
+        { id: 'disabled', apiKey: 'configured-secret', enabled: false, weight: 1 },
+      ])
+    })
+
+    test('should update and clear the provider model catalog', async () => {
+      const svc = new ProviderService()
+      const added = await svc.addProvider(sampleInput({
+        modelCatalog: [{ id: 'old-model', enabled: true }],
+      }))
+
+      const updated = await svc.updateProvider(added.id, {
+        modelCatalog: [
+          { id: 'new-model', contextWindow: 200000, enabled: true },
+          { id: 'disabled-model', enabled: false },
+        ],
+      })
+
+      expect(updated.modelCatalog).toEqual([
+        { id: 'new-model', contextWindow: 200000, enabled: true },
+        { id: 'disabled-model', enabled: false },
+      ])
+      expect((await svc.getProvider(added.id)).modelCatalog).toEqual(updated.modelCatalog)
+
+      const cleared = await svc.updateProvider(added.id, { modelCatalog: null })
+      expect(cleared.modelCatalog).toBeUndefined()
+      expect((await svc.getProvider(added.id)).modelCatalog).toBeUndefined()
     })
 
     test('should throw 404 for non-existent provider', async () => {
@@ -2476,6 +2722,148 @@ describe('ProviderService', () => {
     })
   })
 
+  describe('testProviderKey', () => {
+    test('tests a single saved key through its own proxy', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: Array<{ authorization: string | null; proxy: string | undefined }> = []
+      globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+        calls.push({
+          authorization: new Headers(init?.headers).get('authorization'),
+          proxy: (init as { proxy?: string } | undefined)?.proxy,
+        })
+        return new Response(JSON.stringify({
+          type: 'message',
+          model: 'model-main',
+          content: [],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const provider = await svc.addProvider(sampleInput({
+          apiKey: '',
+          apiKeys: [
+            { id: 'key-a', apiKey: 'sk-a', proxyUrl: 'socks5://127.0.0.1:1080', enabled: true, weight: 1 },
+            { id: 'key-b', apiKey: 'sk-b', enabled: true, weight: 1 },
+          ],
+        }))
+
+        const result = await svc.testProviderKey(provider.id, 'key-a')
+
+        expect(result.connectivity.success).toBe(true)
+        expect(calls[0].authorization).toBe('Bearer sk-a')
+        expect(calls[0].proxy).toBe('socks5://127.0.0.1:1080')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('injects the saved key custom headers into the test request', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: Array<Headers> = []
+      globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+        calls.push(new Headers(init?.headers))
+        return new Response(JSON.stringify({
+          type: 'message',
+          model: 'model-main',
+          content: [],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const provider = await svc.addProvider(sampleInput({
+          apiKey: '',
+          apiKeys: [
+            {
+              id: 'key-a',
+              apiKey: 'sk-a',
+              customHeaders: [
+                { name: 'X-Tenant', value: 'acme' },
+                { name: 'Authorization', value: 'Bearer evil' },
+              ],
+              enabled: true,
+              weight: 1,
+            },
+          ],
+        }))
+
+        const result = await svc.testProviderKey(provider.id, 'key-a')
+
+        expect(result.connectivity.success).toBe(true)
+        expect(calls[0].get('x-tenant')).toBe('acme')
+        // The custom header must never override the real credential.
+        expect(calls[0].get('authorization')).toBe('Bearer sk-a')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('returns 404 for an unknown key id through the API route', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        apiKey: '',
+        apiKeys: [{ id: 'key-a', apiKey: 'sk-a', enabled: true, weight: 1 }],
+      }))
+
+      const { req, url, segments } = makeRequest(
+        'POST',
+        `/api/providers/${provider.id}/keys/missing-key/test`,
+        {},
+      )
+      const response = await handleProvidersApi(req, url, segments)
+
+      expect(response.status).toBe(404)
+    })
+
+    test('tests a saved key through the API route with a model override', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: Array<{ url: string; model: unknown }> = []
+      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+        const payload = JSON.parse(String(init?.body)) as { model?: string }
+        calls.push({ url: String(url), model: payload.model })
+        return new Response(JSON.stringify({
+          type: 'message',
+          model: 'override-model',
+          content: [],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const provider = await svc.addProvider(sampleInput({
+          apiKey: '',
+          apiKeys: [{ id: 'key-a', apiKey: 'sk-a', enabled: true, weight: 1 }],
+        }))
+
+        const { req, url, segments } = makeRequest(
+          'POST',
+          `/api/providers/${provider.id}/keys/key-a/test`,
+          { modelId: 'override-model' },
+        )
+        const response = await handleProvidersApi(req, url, segments)
+        const body = await response.json() as { result: { connectivity: { success: boolean; modelUsed?: string } } }
+
+        expect(response.status).toBe(200)
+        expect(body.result.connectivity.success).toBe(true)
+        expect(calls[0].url).toContain('https://api.example.com/v1/messages')
+        expect(calls[0].model).toBe('override-model')
+        expect(body.result.connectivity.modelUsed).toBe('override-model')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
+
   describe('testProviderConfig', () => {
     for (const [basePath, messagePath] of [
       ['', '/v1/messages'],
@@ -2954,6 +3342,13 @@ describe('Providers API', () => {
       apiFormat: 'anthropic',
       autoCompactWindow: 64000,
       disableExperimentalBetas: true,
+      modelCatalog: [{
+        id: 'catalog-model',
+        name: 'Catalog Model',
+        contextWindow: 320000,
+        supports1m: true,
+        enabled: true,
+      }],
       models: {
         main: 'gpt-4',
         haiku: 'gpt-4-haiku',
@@ -2964,11 +3359,26 @@ describe('Providers API', () => {
     const res = await handleProvidersApi(req, url, segments)
 
     expect(res.status).toBe(201)
-    const body = (await res.json()) as { provider: { name: string; models: { main: string }; autoCompactWindow: number; disableExperimentalBetas?: boolean } }
+    const body = (await res.json()) as {
+      provider: {
+        name: string
+        models: { main: string }
+        autoCompactWindow: number
+        disableExperimentalBetas?: boolean
+        modelCatalog?: Array<Record<string, unknown>>
+      }
+    }
     expect(body.provider.name).toBe('New Provider')
     expect(body.provider.models.main).toBe('gpt-4')
     expect(body.provider.autoCompactWindow).toBe(64000)
     expect(body.provider.disableExperimentalBetas).toBe(true)
+    expect(body.provider.modelCatalog).toEqual([{
+      id: 'catalog-model',
+      name: 'Catalog Model',
+      contextWindow: 320000,
+      supports1m: true,
+      enabled: true,
+    }])
   })
 
   test('POST /api/providers should return 400 for invalid input', async () => {
@@ -3092,6 +3502,41 @@ describe('Providers API', () => {
     const body = (await res.json()) as { provider: { name: string; disableExperimentalBetas?: boolean } }
     expect(body.provider.name).toBe('Renamed Provider')
     expect(body.provider.disableExperimentalBetas).toBe(true)
+  })
+
+  test('PUT /api/providers/:id accepts the desktop key-pool payload with blank proxies', async () => {
+    // The desktop always re-sends every key with proxyUrl: '' when no proxy is
+    // set, and only sends customHeaders when non-empty; the schema must accept
+    // that exact shape (a blank proxy clears, an omitted field keeps).
+    const svc = new ProviderService()
+    const added = await svc.addProvider(sampleInput({
+      apiKey: '',
+      apiKeys: [{
+        id: 'key-a',
+        apiKey: 'sk-a',
+        proxyUrl: 'socks5://127.0.0.1:1080',
+        customHeaders: [{ name: 'X-Tenant', value: 'acme' }],
+        enabled: true,
+        weight: 1,
+      }],
+    }))
+
+    const { req, url, segments } = makeRequest('PUT', `/api/providers/${added.id}`, {
+      name: 'Renamed Provider',
+      apiKeys: [
+        { id: 'key-a', apiKey: 'sk-a', proxyUrl: '', enabled: true, weight: 1 },
+      ],
+      loadBalancing: { strategy: 'failover' },
+    })
+    const res = await handleProvidersApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      provider: { apiKeys?: Array<{ proxyUrl?: string; customHeaders?: unknown }> }
+    }
+    expect(body.provider.apiKeys?.[0]?.proxyUrl).toBeUndefined()
+    // Headers survive an unrelated edit that omits the field.
+    expect(body.provider.apiKeys?.[0]?.customHeaders).toEqual([{ name: 'X-Tenant', value: 'acme' }])
   })
 
   // ─── DELETE /api/providers/:id ───────────────────────────────────────────

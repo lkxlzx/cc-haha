@@ -18,6 +18,7 @@ import {
   getDefaultFableModel,
   getMarketingNameForModel,
   getPublicModelDisplayName,
+  getRuntimeMainLoopModel,
   parseUserSpecifiedModel,
   renderDefaultModelSetting,
 } from './model.js'
@@ -35,6 +36,7 @@ const ENV_KEYS = [
   'CLAUDE_CODE_DISABLE_1M_CONTEXT',
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_SUBAGENT_MODEL',
+  'CC_HAHA_EXACT_RUNTIME_MODEL_ID',
 ] as const
 
 let originalEnv: Record<(typeof ENV_KEYS)[number], string | undefined>
@@ -102,6 +104,22 @@ describe('Fable model configuration', () => {
     expect(parseUserSpecifiedModel('fable[1m]')).toBe(
       'provider-owned-fable[1m]',
     )
+  })
+
+  test('keeps a catalog model ID exact when it collides with a built-in alias', () => {
+    process.env.CC_HAHA_EXACT_RUNTIME_MODEL_ID = 'haiku'
+
+    expect(parseUserSpecifiedModel('haiku')).toBe('haiku')
+    expect(parseUserSpecifiedModel('sonnet')).toBe(getModelStrings().sonnet50)
+    expect(
+      getRuntimeMainLoopModel({
+        permissionMode: 'plan',
+        mainLoopModel: 'haiku',
+      }),
+    ).toBe('haiku')
+
+    process.env.CC_HAHA_EXACT_RUNTIME_MODEL_ID = 'sonnet[1m]'
+    expect(parseUserSpecifiedModel('sonnet[1m]')).toBe('sonnet[1m]')
   })
 
   test('normalizes and renders the public model name', () => {

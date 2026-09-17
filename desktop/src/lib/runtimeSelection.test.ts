@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeRuntimeSelection, resolveDefaultRuntimeSelection, resolveProviderRuntimeModelId, resolveProviderSlotModelId } from './runtimeSelection'
+import {
+  getEnabledProviderCatalogModels,
+  getProviderRuntimeModelIds,
+  normalizeRuntimeSelection,
+  resolveDefaultRuntimeSelection,
+  resolveProviderRuntimeModelId,
+  resolveProviderSlotModelId,
+} from './runtimeSelection'
 import type { SavedProvider } from '../types/provider'
 
 describe('normalizeRuntimeSelection', () => {
@@ -177,5 +184,47 @@ describe('provider 1M runtime selection', () => {
     expect(resolveProviderSlotModelId(legacy, 'haiku')).toBe('old:1m')
     expect(resolveProviderSlotModelId({ ...legacy, model1mSupport: provider.model1mSupport }, 'haiku')).toBe('old')
     expect(resolveProviderSlotModelId({ ...legacy, model1mSupport: provider.model1mSupport }, 'main')).toBe('old[1m]')
+  })
+})
+
+describe('provider model catalog runtime selection', () => {
+  const provider: SavedProvider = {
+    id: 'provider',
+    name: 'Provider',
+    presetId: 'custom',
+    apiKey: 'fixture',
+    baseUrl: 'http://127.0.0.1:9999',
+    apiFormat: 'anthropic',
+    models: {
+      main: 'main-model',
+      haiku: 'fast-model',
+      sonnet: 'balanced-model',
+      opus: 'large-model',
+    },
+    modelCatalog: [
+      { id: 'catalog-model', contextWindow: 200000 },
+      { id: 'long-context-model', supports1m: true },
+      { id: 'retired-model', enabled: false },
+      { id: 'catalog-model', name: 'duplicate' },
+    ],
+  }
+
+  it('filters disabled and duplicate catalog entries', () => {
+    expect(getEnabledProviderCatalogModels(provider)).toEqual([
+      { id: 'catalog-model', contextWindow: 200000 },
+      { id: 'long-context-model', supports1m: true },
+    ])
+  })
+
+  it('treats enabled catalog entries as valid runtime pointers', () => {
+    const ids = getProviderRuntimeModelIds(provider)
+
+    expect(ids.has('catalog-model')).toBe(true)
+    expect(ids.has('long-context-model[1m]')).toBe(true)
+    expect(ids.has('retired-model')).toBe(false)
+    expect(resolveProviderRuntimeModelId(provider, 'catalog-model')).toBe('catalog-model')
+    expect(resolveProviderRuntimeModelId(provider, 'long-context-model')).toBe(
+      'long-context-model[1m]',
+    )
   })
 })

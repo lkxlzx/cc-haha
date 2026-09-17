@@ -44,4 +44,8 @@ describe('provider managed env compatibility', () => {
   test('treats attribution header routing as provider-managed env', () => {
     expect(isProviderManagedEnvVar('CLAUDE_CODE_ATTRIBUTION_HEADER')).toBe(true)
   })
+
+  test('treats the exact runtime model channel as provider-managed env', () => {
+    expect(isProviderManagedEnvVar('CC_HAHA_EXACT_RUNTIME_MODEL_ID')).toBe(true)
+  })
 })

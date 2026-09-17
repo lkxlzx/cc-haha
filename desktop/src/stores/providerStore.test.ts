@@ -151,6 +151,63 @@ describe('providerStore runtime refresh', () => {
     })
   })
 
+  it('keeps an enabled catalog model as the session runtime pointer after a provider refresh', async () => {
+    const provider = makeProvider({
+      modelCatalog: [
+        { id: 'catalog-model', enabled: true },
+        { id: 'retired-model', enabled: false },
+      ],
+    })
+    providersApiMock.update.mockResolvedValue({ provider })
+    providersApiMock.list.mockResolvedValue({ providers: [provider], activeId: provider.id })
+    chatStoreState.sessions = {
+      'session-a': { connectionState: 'connected', chatState: 'idle' },
+    }
+    runtimeStoreState.selections = {
+      'session-a': { providerId: provider.id, modelId: 'catalog-model' },
+    }
+
+    const { useProviderStore } = await import('./providerStore')
+    await useProviderStore.getState().updateProvider(provider.id, { apiKey: 'new-key' })
+
+    expect(setSelectionMock).toHaveBeenCalledWith('session-a', {
+      providerId: provider.id,
+      modelId: 'catalog-model',
+    })
+    expect(setSessionRuntimeMock).toHaveBeenCalledWith('session-a', {
+      providerId: provider.id,
+      modelId: 'catalog-model',
+    })
+  })
+
+  it('falls back to the main slot only when the selected catalog model is disabled', async () => {
+    const provider = makeProvider({
+      modelCatalog: [
+        { id: 'catalog-model', enabled: false },
+      ],
+    })
+    providersApiMock.update.mockResolvedValue({ provider })
+    providersApiMock.list.mockResolvedValue({ providers: [provider], activeId: provider.id })
+    chatStoreState.sessions = {
+      'session-a': { connectionState: 'connected', chatState: 'idle' },
+    }
+    runtimeStoreState.selections = {
+      'session-a': { providerId: provider.id, modelId: 'catalog-model' },
+    }
+
+    const { useProviderStore } = await import('./providerStore')
+    await useProviderStore.getState().updateProvider(provider.id, { modelCatalog: provider.modelCatalog })
+
+    expect(setSelectionMock).toHaveBeenCalledWith('session-a', {
+      providerId: provider.id,
+      modelId: 'model-main',
+    })
+    expect(setSessionRuntimeMock).toHaveBeenCalledWith('session-a', {
+      providerId: provider.id,
+      modelId: 'model-main',
+    })
+  })
+
   it.each([true, false])('refreshes saved model capabilities for idle, disconnected and draft selections (1m=%s)', async (enabled) => {
     const provider = makeProvider({ model1mSupport: { main: enabled, haiku: false, sonnet: false, opus: enabled } })
     providersApiMock.update.mockResolvedValue({ provider })

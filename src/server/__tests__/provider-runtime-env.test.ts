@@ -388,6 +388,41 @@ describe('providerRuntimeEnv', () => {
     expect(env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBeUndefined()
   })
 
+  test('merges enabled catalog context windows without changing the default model pointer', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-catalog',
+      providers: [{
+        id: 'provider-catalog',
+        presetId: 'custom',
+        name: 'Catalog provider',
+        apiKey: 'sk-catalog',
+        authStrategy: 'auth_token',
+        baseUrl: 'https://catalog.example.com',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'main-model',
+          haiku: 'fast-model',
+          sonnet: 'balanced-model',
+          opus: 'large-model',
+        },
+        modelCatalog: [
+          { id: 'catalog-model', contextWindow: 320000 },
+          { id: 'disabled-model', contextWindow: 640000, enabled: false },
+        ],
+      }],
+    })
+
+    const env = readActiveProviderManagedEnv(tmpDir)
+
+    expect(env?.ANTHROPIC_MODEL).toBe('main-model')
+    expect(JSON.parse(env!.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toMatchObject({
+      'catalog-model': 320000,
+    })
+    expect(JSON.parse(env!.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).not.toHaveProperty(
+      'disabled-model',
+    )
+  })
+
   test('honors explicitly enabled tool search for native Anthropic providers', async () => {
     await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
       schemaVersion: PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,

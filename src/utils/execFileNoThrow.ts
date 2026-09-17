@@ -116,6 +116,7 @@ export function execFileNoThrowWithCwd(
       shell,
       stdin: finalStdin,
       input: finalInput,
+      windowsHide: true,
       reject: false, // Don't throw on non-zero exit codes
     })
       .then(result => {

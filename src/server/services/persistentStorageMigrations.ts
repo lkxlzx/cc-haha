@@ -7,11 +7,11 @@ import { isOpenAIOfficialProviderId } from './openaiOfficialProvider.js'
 import { isGrokOfficialProviderId } from './grokOfficialProvider.js'
 import {
   BUILT_IN_PROVIDER_IDS,
+  PROVIDER_KEY_POOL_SCHEMA_VERSION,
   PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,
-  PROVIDER_REQUEST_COMPATIBILITY_SCHEMA_VERSION,
 } from '../types/provider.js'
 
-export const CURRENT_PROVIDER_INDEX_SCHEMA_VERSION = PROVIDER_REQUEST_COMPATIBILITY_SCHEMA_VERSION
+export const CURRENT_PROVIDER_INDEX_SCHEMA_VERSION = PROVIDER_KEY_POOL_SCHEMA_VERSION
 
 type MigrationReport = {
   migratedEntries: string[]
@@ -175,12 +175,46 @@ function migrateProvidersIndex(value: unknown): JsonObject {
   const sourceSchemaVersion = typeof value.schemaVersion === 'number' ? value.schemaVersion : 1
   // v5 introduces optional requestCompatibility. An absent object is the
   // automatic policy, so upgrading v4 must not materialize a numeric budget
-  // from old Claude defaults. Spreading providers also preserves future fields.
+  // from old Claude defaults. v6 adds an optional model catalog; v7 promotes
+  // the legacy single API key into the first entry of a key pool. Spreading
+  // providers preserves future fields.
   const providers = value.providers
     .filter(isSavedProvider)
     .map((provider) => sourceSchemaVersion < PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION
       ? { ...provider, toolSearchEnabled: false }
       : provider)
+    .map((provider) => {
+      const legacyApiKey = typeof provider.apiKey === 'string' ? provider.apiKey.trim() : ''
+      const configuredKeys = Array.isArray(provider.apiKeys) ? provider.apiKeys : undefined
+      const apiKeys = configuredKeys ?? (
+        legacyApiKey
+          ? [{
+              id: 'primary',
+              apiKey: legacyApiKey,
+              enabled: true,
+              weight: 1,
+            }]
+          : undefined
+      )
+      const firstEnabled = apiKeys?.find((key) =>
+        isRecord(key) &&
+        key.enabled !== false &&
+        typeof key.apiKey === 'string' &&
+        !!key.apiKey.trim(),
+      )
+      return {
+        ...provider,
+        apiKey: isRecord(firstEnabled) && typeof firstEnabled.apiKey === 'string'
+          ? firstEnabled.apiKey.trim()
+          : '',
+        ...(apiKeys !== undefined && { apiKeys }),
+        ...(apiKeys?.length && {
+          loadBalancing: isRecord(provider.loadBalancing)
+            ? provider.loadBalancing
+            : { strategy: 'round_robin' },
+        }),
+      }
+    })
   const rawActiveId =
     typeof value.activeId === 'string'
       ? value.activeId

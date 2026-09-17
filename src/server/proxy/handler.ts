@@ -15,7 +15,19 @@ import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.j
 import { createGunzip, createInflate } from 'node:zlib'
 
 import { ProviderService } from '../services/providerService.js'
-import type { ProviderAuthStrategy } from '../types/provider.js'
+import { applyCustomRequestHeaders } from '../services/customRequestHeaders.js'
+import type {
+  ProviderApiKey,
+  ProviderAuthStrategy,
+  ProviderLoadBalancing,
+  RequestCompatibility,
+} from '../types/provider.js'
+import {
+  classifyProviderKeyFailure,
+  isRetryableProviderKeyFailure,
+  providerKeyPool,
+  providerRetryAfterMs,
+} from '../services/providerKeyPool.js'
 import { resolvePromptCacheKey } from './promptCacheKey.js'
 import { anthropicToOpenaiChat } from './transform/anthropicToOpenaiChat.js'
 import { anthropicToOpenaiResponses } from './transform/anthropicToOpenaiResponses.js'
@@ -46,6 +58,24 @@ import {
 import { resolveModelReasoningProfile } from '../../shared/modelReasoning.js'
 
 const providerService = new ProviderService()
+
+type ProxyProviderConfig = {
+  id: string
+  name: string
+  baseUrl: string
+  /**
+   * @deprecated Legacy single-key value, kept for callers that still read it.
+   * Key-pool routing uses `apiKeys` exclusively; this may be an empty string
+   * when the provider has an explicit (but fully disabled) key pool.
+   */
+  apiKey: string
+  apiKeys: ProviderApiKey[]
+  loadBalancing: ProviderLoadBalancing
+  apiFormat: 'anthropic' | 'openai_chat' | 'openai_responses'
+  supportsNestedToolResultMedia: boolean
+  authStrategy: ProviderAuthStrategy
+  requestCompatibility?: RequestCompatibility
+}
 
 type ProxyFetchOptions = ReturnType<typeof getProxyFetchOptions>
 // `decompress` is a Bun fetch option absent from the DOM RequestInit type.
@@ -123,12 +153,115 @@ async function fetchUpstreamWithTimeout(
   }
 }
 
+type RotatingUpstreamRequest = {
+  url: string
+  headers: Record<string, string>
+  body: string
+  decompress?: boolean
+}
+
+async function fetchUpstreamWithKeyRotation(
+  config: ProxyProviderConfig,
+  isStream: boolean,
+  networkSettings: NetworkSettings,
+  createRequest: (apiKey: string) => RotatingUpstreamRequest,
+): Promise<{
+  response: Response
+  keyId: string
+  request: RotatingUpstreamRequest
+  attemptCount: number
+}> {
+  const enabledKeyCount = config.apiKeys.filter((key) => key.enabled).length
+  const maxAttempts = Math.min(3, enabledKeyCount)
+  const attemptedKeyIds = new Set<string>()
+  let lastError: unknown
+  let lastResponse: Response | undefined
+  let lastRequest: RotatingUpstreamRequest | undefined
+  let lastKeyId = ''
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const selection = providerKeyPool.select(
+      config.id,
+      config.apiKeys,
+      config.loadBalancing.strategy,
+      attemptedKeyIds,
+    )
+    if (!selection) break
+
+    const request = createRequest(selection.key.apiKey)
+    if (selection.key.customHeaders?.length) {
+      request.headers = applyCustomRequestHeaders(request.headers, selection.key.customHeaders)
+    }
+    const keyProxyUrl = selection.key.proxyUrl?.trim()
+    const requestNetworkSettings = keyProxyUrl
+      ? { ...networkSettings, proxy: { mode: 'manual' as const, url: keyProxyUrl } }
+      : networkSettings
+    const proxyOptions = getNetworkProxyFetchOptions(requestNetworkSettings, request.url)
+    attemptedKeyIds.add(selection.key.id)
+    lastRequest = request
+    lastKeyId = selection.key.id
+
+    try {
+      const response = await fetchUpstreamWithTimeout(request.url, {
+        method: 'POST',
+        headers: request.headers,
+        body: request.body,
+        ...(request.decompress !== undefined ? { decompress: request.decompress } : {}),
+        ...proxyOptions,
+      }, networkSettings.aiRequestTimeoutMs, isStream)
+
+      const failure = classifyProviderKeyFailure(response.status)
+      const canRetry = isRetryableProviderKeyFailure(failure) &&
+        attemptedKeyIds.size < maxAttempts
+      providerKeyPool.report(
+        config.id,
+        selection.key.id,
+        failure,
+        failure === 'rate_limit'
+          ? { retryAfterMs: providerRetryAfterMs(response.headers) }
+          : undefined,
+      )
+
+      if (canRetry) {
+        if (response.body) {
+          await response.body.cancel().catch(() => undefined)
+        }
+        lastResponse = response
+        continue
+      }
+
+      return {
+        response,
+        keyId: selection.key.id,
+        request,
+        attemptCount: attemptedKeyIds.size,
+      }
+    } catch (error) {
+      providerKeyPool.report(config.id, selection.key.id, 'transient')
+      lastError = error
+    }
+  }
+
+  if (lastResponse) {
+    return {
+      response: lastResponse,
+      keyId: lastKeyId,
+      request: lastRequest!,
+      attemptCount: attemptedKeyIds.size,
+    }
+  }
+  if (lastError !== undefined) throw lastError
+  throw new Error('No enabled API key is available for this provider')
+}
+
 export function withStreamIdleTimeout(
   upstream: ReadableStream<Uint8Array>,
   timeoutMs: number,
 ): ReadableStream<Uint8Array> {
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
+  let timedOut = false
+  let streamController: ReadableStreamDefaultController<Uint8Array> | null = null
 
   const clearIdleTimer = () => {
     if (timer) {
@@ -137,43 +270,53 @@ export function withStreamIdleTimeout(
     }
   }
 
-  return new ReadableStream({
-    async start(controller) {
-      reader = upstream.getReader()
-      let timedOut = false
+  const releaseReader = () => {
+    if (!reader) return
+    reader.releaseLock()
+    reader = null
+  }
 
-      const armIdleTimer = () => {
-        clearIdleTimer()
-        timer = setTimeout(() => {
-          timedOut = true
-          void reader?.cancel('stream idle timeout').catch(() => undefined)
-          controller.error(new Error(`Upstream stream idle timeout after ${timeoutMs}ms`))
-        }, timeoutMs)
-      }
+  const armIdleTimer = (): void => {
+    clearIdleTimer()
+    timer = setTimeout(() => {
+      timedOut = true
+      clearIdleTimer()
+      void reader?.cancel('stream idle timeout').finally(releaseReader)
+      streamController?.error(new Error(`Upstream stream idle timeout after ${timeoutMs}ms`))
+    }, timeoutMs)
+  }
+
+  return new ReadableStream({
+    start(controller) {
+      streamController = controller
+      reader = upstream.getReader()
+    },
+    async pull(controller) {
+      if (!reader || timedOut) return
+      armIdleTimer()
 
       try {
-        armIdleTimer()
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          if (timedOut) break
-
-          controller.enqueue(value)
-          armIdleTimer()
-        }
+        const { done, value } = await reader.read()
         clearIdleTimer()
-        if (!timedOut) controller.close()
+        if (timedOut) return
+        if (done) {
+          controller.close()
+          releaseReader()
+        } else {
+          controller.enqueue(value)
+        }
       } catch (err) {
         clearIdleTimer()
-        if (!timedOut) controller.error(err)
-      } finally {
-        reader?.releaseLock()
-        reader = null
+        if (!timedOut) {
+          controller.error(err)
+          releaseReader()
+        }
       }
     },
     cancel(reason) {
       clearIdleTimer()
-      return reader?.cancel(reason)
+      timedOut = true
+      return reader?.cancel(reason).finally(releaseReader)
     },
   })
 }
@@ -245,26 +388,32 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
       // of nested tool-result media (supportsNestedToolResultMedia=false) route
       // through the proxy so images/documents can be lifted out of tool_result
       // before the request reaches an endpoint that would drop them.
-      if (config.supportsNestedToolResultMedia) {
+      if (
+        config.supportsNestedToolResultMedia &&
+        config.apiKeys.filter((key) => key.enabled).length <= 1
+      ) {
+        const keyHint = config.apiKeys.filter((key) => key.enabled).length === 1
+          ? ' Enable at least one more key to use load balancing, or set nested tool-result media to unsupported.'
+          : ''
         return Response.json(
           {
             type: 'error',
             error: {
               type: 'invalid_request_error',
               message: providerId
-                ? `Provider "${providerId}" uses anthropic format — proxy not needed`
-                : 'Active provider uses anthropic format — proxy not needed',
+                ? `Provider "${providerId}" uses anthropic format — proxy not needed.${keyHint}`
+                : `Active provider uses anthropic format — proxy not needed.${keyHint}`,
             },
           },
           { status: 400 },
         )
       }
-      return await handleAnthropicCompatible(body, baseUrl, config.apiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext)
+      return await handleAnthropicCompatible(body, config, req.headers, isStream, networkSettings, traceContext)
     }
     if (config.apiFormat === 'openai_chat') {
-      return await handleOpenaiChat(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, requestOptions)
+      return await handleOpenaiChat(body, config, isStream, networkSettings, traceContext, requestOptions)
     }
-    return await handleOpenaiResponses(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, promptCacheKey, requestOptions)
+    return await handleOpenaiResponses(body, config, isStream, networkSettings, traceContext, promptCacheKey, requestOptions)
   } catch (err) {
     if (traceContext && !wasTraceErrorRecorded(err) && !recordedTraceErrorContexts.has(traceContext)) {
       void recordProxyTrace({
@@ -444,36 +593,78 @@ function stripHopByHopHeaders(headers: Headers): Headers {
  */
 async function handleAnthropicCompatible(
   body: AnthropicRequest,
-  baseUrl: string,
-  apiKey: string,
-  authStrategy: ProviderAuthStrategy,
+  config: ProxyProviderConfig,
   incomingHeaders: Headers,
   isStream: boolean,
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
 ): Promise<Response> {
   const transformed = hoistToolResultMediaForCompatibility(body)
-  const url = `${normalizeAnthropicBaseUrl(baseUrl)}/v1/messages`
-  const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
-
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...buildAnthropicAuthHeaders(apiKey, authStrategy),
-  }
-  // Preserve protocol and custom headers from the incoming request
-  // (anthropic-version is required; anthropic-beta and custom headers such as
-  // those injected via ANTHROPIC_CUSTOM_HEADERS carry real semantics for the
-  // upstream endpoint). Hop-by-hop and auth headers are not forwarded.
+  const url = `${normalizeAnthropicBaseUrl(config.baseUrl)}/v1/messages`
   const deny = hopByHopDenySet(incomingHeaders)
-  for (const [name, value] of incomingHeaders.entries()) {
-    const lower = name.toLowerCase()
-    if (deny.has(lower) || isInternalClientHeader(lower, value)) continue
-    // The local proxy's authority must not replace the upstream host.
-    if (lower === 'host' || lower === 'content-type' || lower === 'content-length') continue
-    if (lower === 'x-api-key' || lower === 'authorization') continue
-    if (value) headers[name] = value
+  const buildRequest = (apiKey: string): RotatingUpstreamRequest => {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...buildAnthropicAuthHeaders(apiKey, config.authStrategy),
+    }
+    // Preserve protocol and custom headers from the incoming request. The
+    // selected key's auth headers intentionally replace whatever the CLI sent
+    // to the local proxy.
+    for (const [name, value] of incomingHeaders.entries()) {
+      const lower = name.toLowerCase()
+      if (deny.has(lower) || isInternalClientHeader(lower, value)) continue
+      if (lower === 'host' || lower === 'content-type' || lower === 'content-length') continue
+      if (lower === 'x-api-key' || lower === 'authorization') continue
+      if (value) headers[name] = value
+    }
+    return {
+      url,
+      headers,
+      body: JSON.stringify(transformed),
+      decompress: false,
+    }
   }
 
+  let upstream: Response
+  let request: RotatingUpstreamRequest
+  try {
+    const result = await fetchUpstreamWithKeyRotation(
+      config,
+      isStream,
+      networkSettings,
+      buildRequest,
+    )
+    upstream = result.response
+    request = result.request
+  } catch (err) {
+    if (traceContext) {
+      recordProxyTraceInBackground({
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: { 'Content-Type': 'application/json' },
+        startedAt: new Date().toISOString(),
+        startedAtMs: Date.now(),
+        error: err,
+      })
+      markTraceErrorRecorded(err)
+      recordedTraceErrorContexts.add(traceContext)
+    }
+    console.error('[Proxy] Upstream anthropic request failed:', err)
+    return Response.json(
+      {
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: err instanceof Error ? err.message : String(err),
+        },
+      },
+      { status: 502 },
+    )
+  }
+
+  const headers = request.headers
   const traceHeaders = Object.fromEntries(
     Object.entries(headers).map(([name, value]) => {
       const lower = name.toLowerCase()
@@ -485,7 +676,6 @@ async function handleAnthropicCompatible(
       ]
     }),
   )
-
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
   const traceCallId = traceContext
@@ -499,9 +689,6 @@ async function handleAnthropicCompatible(
       })
     : undefined
 
-  // Close the pending trace started above when the upstream call fails, so the
-  // caller's unified error handling does not record a second trace for the
-  // same request.
   const recordTraceError = (err: unknown): void => {
     if (!traceContext) return
     recordProxyTraceInBackground({
@@ -517,33 +704,6 @@ async function handleAnthropicCompatible(
     })
     markTraceErrorRecorded(err)
     recordedTraceErrorContexts.add(traceContext)
-  }
-
-  let upstream: Response
-  try {
-    upstream = await fetchUpstreamWithTimeout(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(transformed),
-      // Keep the raw bytes: Bun decompresses by default, which would leave a
-      // decompressed body behind the upstream Content-Encoding/Length headers
-      // when forwarding the response unchanged.
-      decompress: false,
-      ...proxyOptions,
-    }, networkSettings.aiRequestTimeoutMs, isStream)
-  } catch (err) {
-    recordTraceError(err)
-    console.error('[Proxy] Upstream anthropic request failed:', err)
-    return Response.json(
-      {
-        type: 'error',
-        error: {
-          type: 'api_error',
-          message: err instanceof Error ? err.message : String(err),
-        },
-      },
-      { status: 502 },
-    )
   }
 
   try {
@@ -661,13 +821,13 @@ async function handleAnthropicCompatible(
 
 async function handleOpenaiChat(
   body: AnthropicRequest,
-  baseUrl: string,
-  apiKey: string,
+  config: ProxyProviderConfig,
   isStream: boolean,
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
   requestOptions: RequestCompatibilityOptions = {},
 ): Promise<Response> {
+  const baseUrl = config.baseUrl
   const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
   const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
   const transformed = anthropicToOpenaiChat(body, {
@@ -681,11 +841,41 @@ async function handleOpenaiChat(
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_chat' }).outputBudget)
   }
   const url = buildOpenaiEndpoint(baseUrl, 'chat/completions')
-  const upstreamRequestHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey}`,
+  let upstream: Response
+  let upstreamRequestHeaders: Record<string, string>
+  try {
+    const result = await fetchUpstreamWithKeyRotation(
+      config,
+      isStream,
+      networkSettings,
+      (apiKey) => ({
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(transformed),
+      }),
+    )
+    upstream = result.response
+    upstreamRequestHeaders = result.request.headers
+  } catch (err) {
+    if (traceContext) {
+      recordProxyTraceInBackground({
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: { 'Content-Type': 'application/json' },
+        startedAt: new Date().toISOString(),
+        startedAtMs: Date.now(),
+        error: err,
+      })
+      markTraceErrorRecorded(err)
+    }
+    throw err
   }
-  const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
+
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
   const traceCallId = traceContext
@@ -698,32 +888,6 @@ async function handleOpenaiChat(
         startedAt,
       })
     : undefined
-
-  let upstream: Response
-  try {
-    upstream = await fetchUpstreamWithTimeout(url, {
-      method: 'POST',
-      headers: upstreamRequestHeaders,
-      body: JSON.stringify(transformed),
-      ...proxyOptions,
-    }, networkSettings.aiRequestTimeoutMs, isStream)
-  } catch (err) {
-    if (traceContext) {
-      recordProxyTraceInBackground({
-        callId: traceCallId,
-        context: traceContext,
-        model: body.model,
-        upstreamUrl: url,
-        upstreamRequest: transformed,
-        requestHeaders: upstreamRequestHeaders,
-        startedAt,
-        startedAtMs,
-        error: err,
-      })
-      markTraceErrorRecorded(err)
-    }
-    throw err
-  }
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
@@ -872,25 +1036,55 @@ function hasExplicitVisionModelMarker(model: string): boolean {
 
 async function handleOpenaiResponses(
   body: AnthropicRequest,
-  baseUrl: string,
-  apiKey: string,
+  config: ProxyProviderConfig,
   isStream: boolean,
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
   promptCacheKey?: string,
   requestOptions: RequestCompatibilityOptions = {},
 ): Promise<Response> {
+  const baseUrl = config.baseUrl
   const transformed = anthropicToOpenaiResponses(body, { ...requestOptions, cacheKey: promptCacheKey })
   if (traceContext) {
     traceContext.protocolTrace = new ProtocolTraceObserver('openai_responses', transformed,
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_responses' }).outputBudget)
   }
   const url = buildOpenaiEndpoint(baseUrl, 'responses')
-  const upstreamRequestHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey}`,
+  let upstream: Response
+  let upstreamRequestHeaders: Record<string, string>
+  try {
+    const result = await fetchUpstreamWithKeyRotation(
+      config,
+      isStream,
+      networkSettings,
+      (apiKey) => ({
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(transformed),
+      }),
+    )
+    upstream = result.response
+    upstreamRequestHeaders = result.request.headers
+  } catch (err) {
+    if (traceContext) {
+      recordProxyTraceInBackground({
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: { 'Content-Type': 'application/json' },
+        startedAt: new Date().toISOString(),
+        startedAtMs: Date.now(),
+        error: err,
+      })
+      markTraceErrorRecorded(err)
+    }
+    throw err
   }
-  const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
+
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
   const traceCallId = traceContext
@@ -903,32 +1097,6 @@ async function handleOpenaiResponses(
         startedAt,
       })
     : undefined
-
-  let upstream: Response
-  try {
-    upstream = await fetchUpstreamWithTimeout(url, {
-      method: 'POST',
-      headers: upstreamRequestHeaders,
-      body: JSON.stringify(transformed),
-      ...proxyOptions,
-    }, networkSettings.aiRequestTimeoutMs, isStream)
-  } catch (err) {
-    if (traceContext) {
-      recordProxyTraceInBackground({
-        callId: traceCallId,
-        context: traceContext,
-        model: body.model,
-        upstreamUrl: url,
-        upstreamRequest: transformed,
-        requestHeaders: upstreamRequestHeaders,
-        startedAt,
-        startedAtMs,
-        error: err,
-      })
-      markTraceErrorRecorded(err)
-    }
-    throw err
-  }
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')

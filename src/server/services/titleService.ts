@@ -7,8 +7,23 @@
  */
 
 import { ProviderService } from './providerService.js'
+import {
+  applyCustomRequestHeaders,
+  type CustomRequestHeader,
+} from './customRequestHeaders.js'
 import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.js'
-import { getPresetAuthStrategy } from './providerRuntimeEnv.js'
+import {
+  getEnabledProviderApiKeys,
+  getPresetAuthStrategy,
+  getPresetDefaultEnv,
+  resolveProviderApiKey,
+} from './providerRuntimeEnv.js'
+import {
+  classifyProviderKeyFailure,
+  isRetryableProviderKeyFailure,
+  providerKeyPool,
+  providerRetryAfterMs,
+} from './providerKeyPool.js'
 import {
   getNetworkProxyFetchOptions,
   loadNetworkSettings,
@@ -23,7 +38,11 @@ import { anthropicToOpenaiResponses } from '../proxy/transform/anthropicToOpenai
 import { openaiResponsesStreamToAnthropicResponse } from '../proxy/streaming/openaiResponsesStreamToAnthropicResponse.js'
 import { cleanSessionTitleSource, hasSessionTitleMarkup } from '../../utils/sessionTitleText.js'
 import { extractConversationText, SESSION_TITLE_PROMPT } from '../../utils/sessionTitle.js'
-import type { ProviderAuthStrategy } from '../types/provider.js'
+import type {
+  ProviderApiKey,
+  ProviderAuthStrategy,
+  SavedProvider,
+} from '../types/provider.js'
 
 const TITLE_MAX_LEN = 50
 const TITLE_MAX_OUTPUT_TOKENS = 100
@@ -193,40 +212,177 @@ export async function generateTitle(
       )
     }
 
-    if (!resolvedProvider?.baseUrl || !resolvedProvider?.apiKey) return null
+    if (!resolvedProvider?.baseUrl) return null
 
     const model = resolvedProvider.models.haiku || resolvedProvider.models.main
     const url = `${normalizeAnthropicBaseUrl(resolvedProvider.baseUrl.replace(/\/+$/, ''))}/v1/messages`
     const authStrategy = resolvedProvider.authStrategy ?? getPresetAuthStrategy(resolvedProvider.presetId)
-    const requestHeaders = buildAnthropicTitleRequestHeaders(resolvedProvider.apiKey, authStrategy)
-    const requestBody = {
+    return await generateAnthropicTitleWithKeyPool(
+      resolvedProvider,
+      url,
       model,
-      max_tokens: TITLE_MAX_OUTPUT_TOKENS,
-      system: SESSION_TITLE_PROMPT,
-    }
-
-    return await generateTitleWithLanguageRetry(
-      async (strictLanguage) => {
-        const response = await fetchAnthropicTitleResponse(
-          url,
-          requestHeaders,
-          {
-            ...requestBody,
-            messages: [{
-              role: 'user',
-              content: buildTitleUserPrompt(trimmed, languagePreference, strictLanguage),
-            }],
-          },
-          networkSettings,
-        )
-        if (!response) return null
-        return parseGeneratedTitleText(response)
-      },
+      trimmed,
+      authStrategy,
+      networkSettings,
       languagePreference,
     )
   } catch {
     return null
   }
+}
+
+type AnthropicTitleFetchResult = {
+  text: string | null
+  status: number
+  retryAfterMs?: number
+}
+
+type AnthropicTitleAttempt = {
+  title: string | null
+  status: number
+  retryAfterMs?: number
+}
+
+function resolveTitleProviderKeys(provider: SavedProvider): ProviderApiKey[] {
+  const configured = getEnabledProviderApiKeys(provider)
+  if (configured.length > 0 || provider.apiKeys !== undefined) return configured
+
+  const fallback = resolveProviderApiKey(provider, getPresetDefaultEnv(provider.presetId))
+  return fallback
+    ? [{
+        id: 'preset-default',
+        apiKey: fallback,
+        enabled: true,
+        weight: 1,
+      }]
+    : []
+}
+
+async function generateAnthropicTitleWithKeyPool(
+  provider: SavedProvider,
+  url: string,
+  model: string,
+  trimmed: string,
+  authStrategy: ProviderAuthStrategy,
+  networkSettings: NetworkSettings,
+  languagePreference?: TitleLanguagePreference | null,
+): Promise<string | null> {
+  const keys = resolveTitleProviderKeys(provider)
+  if (keys.length === 0) return null
+
+  const strategy = provider.loadBalancing?.strategy ?? 'round_robin'
+  const maxAttempts = Math.min(3, keys.length)
+  const attemptedKeyIds = new Set<string>()
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const selection = providerKeyPool.select(
+      provider.id,
+      keys,
+      strategy,
+      attemptedKeyIds,
+    )
+    if (!selection) break
+    attemptedKeyIds.add(selection.key.id)
+
+    const keyProxyUrl = selection.key.proxyUrl?.trim()
+    const requestNetworkSettings = keyProxyUrl
+      ? { ...networkSettings, proxy: { mode: 'manual' as const, url: keyProxyUrl } }
+      : networkSettings
+
+    let result: AnthropicTitleAttempt
+    try {
+      result = await requestAnthropicTitleForKey(
+        selection.key.apiKey,
+        url,
+        model,
+        trimmed,
+        authStrategy,
+        requestNetworkSettings,
+        languagePreference,
+        selection.key.customHeaders?.length ? selection.key.customHeaders : undefined,
+      )
+    } catch {
+      providerKeyPool.report(provider.id, selection.key.id, 'transient')
+      continue
+    }
+
+    const failure = classifyProviderKeyFailure(result.status)
+    providerKeyPool.report(
+      provider.id,
+      selection.key.id,
+      failure,
+      failure === 'rate_limit' && result.retryAfterMs !== undefined
+        ? { retryAfterMs: result.retryAfterMs }
+        : undefined,
+    )
+    if (result.title || !isRetryableProviderKeyFailure(failure)) {
+      return result.title
+    }
+  }
+
+  return null
+}
+
+async function requestAnthropicTitleForKey(
+  apiKey: string,
+  url: string,
+  model: string,
+  trimmed: string,
+  authStrategy: ProviderAuthStrategy,
+  networkSettings: NetworkSettings,
+  languagePreference?: TitleLanguagePreference | null,
+  customHeaders?: readonly CustomRequestHeader[],
+): Promise<AnthropicTitleAttempt> {
+  const requestHeaders = applyCustomRequestHeaders(
+    buildAnthropicTitleRequestHeaders(apiKey, authStrategy),
+    customHeaders,
+  )
+  const requestBody = {
+    model,
+    max_tokens: TITLE_MAX_OUTPUT_TOKENS,
+    system: SESSION_TITLE_PROMPT,
+  }
+
+  return await generateTitleWithLanguageRetryResult(
+    async (strictLanguage) => {
+      const response = await fetchAnthropicTitleResponse(
+        url,
+        requestHeaders,
+        {
+          ...requestBody,
+          messages: [{
+            role: 'user',
+            content: buildTitleUserPrompt(trimmed, languagePreference, strictLanguage),
+          }],
+        },
+        networkSettings,
+      )
+      return {
+        title: response.text ? parseGeneratedTitleText(response.text) : null,
+        status: response.status,
+        ...(response.retryAfterMs !== undefined
+          ? { retryAfterMs: response.retryAfterMs }
+          : {}),
+      }
+    },
+    languagePreference,
+  )
+}
+
+async function generateTitleWithLanguageRetryResult(
+  requestTitle: (strictLanguage: boolean) => Promise<AnthropicTitleAttempt>,
+  languagePreference?: TitleLanguagePreference | null,
+): Promise<AnthropicTitleAttempt> {
+  const first = await requestTitle(false)
+  if (!first.title || isTitleLanguageCompatible(first.title, languagePreference)) {
+    return first
+  }
+
+  const retried = await requestTitle(true)
+  if (!retried.title || !isTitleLanguageCompatible(retried.title, languagePreference)) {
+    return { ...retried, title: null }
+  }
+  return retried
 }
 
 async function generateOpenAIOfficialTitle(
@@ -292,7 +448,7 @@ async function fetchAnthropicTitleResponse(
   requestHeaders: Record<string, string>,
   requestBody: Record<string, unknown>,
   networkSettings: NetworkSettings,
-): Promise<string | null> {
+): Promise<AnthropicTitleFetchResult> {
   let response = await fetch(url, {
     method: 'POST',
     headers: requestHeaders,
@@ -304,7 +460,7 @@ async function fetchAnthropicTitleResponse(
     ...getNetworkProxyFetchOptions(networkSettings, url),
   })
 
-  if (!response.ok && response.status >= 400 && response.status < 500) {
+  if (!response.ok && (response.status === 400 || response.status === 422)) {
     response = await fetch(url, {
       method: 'POST',
       headers: requestHeaders,
@@ -314,12 +470,25 @@ async function fetchAnthropicTitleResponse(
     })
   }
 
-  if (!response.ok) return null
-
-  const body = (await response.json()) as {
-    content?: Array<{ type: string; text?: string }>
+  if (!response.ok) {
+    return {
+      text: null,
+      status: response.status,
+      retryAfterMs: providerRetryAfterMs(response.headers),
+    }
   }
-  return body.content?.find((b) => b.type === 'text')?.text ?? null
+
+  try {
+    const body = (await response.json()) as {
+      content?: Array<{ type: string; text?: string }>
+    }
+    return {
+      text: body.content?.find((b) => b.type === 'text')?.text ?? null,
+      status: response.status,
+    }
+  } catch {
+    return { text: null, status: response.status }
+  }
 }
 
 async function generateTitleWithLanguageRetry(

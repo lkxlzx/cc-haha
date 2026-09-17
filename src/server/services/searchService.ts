@@ -1471,6 +1471,7 @@ export class SearchService {
       const proc = spawn(cmd, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         ...(spawnOptions?.argv0 ? { argv0: spawnOptions.argv0 } : {}),
+        windowsHide: true,
       })
       const chunks: Buffer[] = []
       const errorChunks: Buffer[] = []
@@ -1538,6 +1539,7 @@ export class SearchService {
       const proc = spawn(cmd, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         ...(spawnOptions?.argv0 ? { argv0: spawnOptions.argv0 } : {}),
+        windowsHide: true,
       })
       const decoder = new StringDecoder('utf8')
       let pending = ''
@@ -1632,7 +1634,10 @@ export class SearchService {
     if (cached) return cached
     const lookupPromise = new Promise<boolean>((resolve) => {
       const lookup = process.platform === 'win32' ? 'where' : 'which'
-      const proc = spawn(lookup, [cmd], { stdio: 'ignore' })
+      const proc = spawn(lookup, [cmd], {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
       proc.on('close', (code) => resolve(code === 0))
       proc.on('error', () => resolve(false))
     })

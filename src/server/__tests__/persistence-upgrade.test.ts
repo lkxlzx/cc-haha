@@ -96,6 +96,14 @@ describe('persistent storage upgrade migrations', () => {
     expect(migrated.activeProviderId).toBeUndefined()
     expect(migrated.rootFutureField).toEqual({ keep: true })
     expect(migrated.providers?.[0]?.extraFutureField).toBe('keep-me')
+    expect(migrated.providers?.[0]?.apiKey).toBe('token')
+    expect(migrated.providers?.[0]?.apiKeys).toEqual([{
+      id: 'primary',
+      apiKey: 'token',
+      enabled: true,
+      weight: 1,
+    }])
+    expect(migrated.providers?.[0]?.loadBalancing).toEqual({ strategy: 'round_robin' })
 
     const backups = (await listFiles(ccHahaDir)).filter((file) => file.startsWith('providers.json.bak-before-migration-'))
     expect(backups.length).toBe(1)
@@ -207,6 +215,13 @@ describe('persistent storage upgrade migrations', () => {
           presetId: 'custom',
           name: 'Current Provider',
           apiKey: 'chat-token',
+          apiKeys: [{
+            id: 'primary',
+            apiKey: 'chat-token',
+            enabled: true,
+            weight: 1,
+          }],
+          loadBalancing: { strategy: 'round_robin' },
           baseUrl: 'https://current.example.test',
           apiFormat: 'anthropic',
           toolSearchEnabled: true,
@@ -465,5 +480,103 @@ describe('persistent storage upgrade migrations', () => {
     const rewritten = JSON.parse(await fs.readFile(file, 'utf8'))
     expect(rewritten.providers[1].requestCompatibility.futureParameter).toBe('keep')
     expect(rewritten.providers[0].futureProvider).toBe('keep')
+  })
+
+  test('upgrades a v5 provider index without a model catalog', async () => {
+    const dir = path.join(tempDir, 'cc-haha')
+    const file = path.join(dir, 'providers.json')
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(
+      file,
+      JSON.stringify({
+        schemaVersion: 5,
+        activeId: 'provider-v5',
+        providers: [{
+          id: 'provider-v5',
+          presetId: 'custom',
+          name: 'Version 5 Provider',
+          apiKey: 'fake-test-token',
+          baseUrl: 'https://v5.example.test',
+          apiFormat: 'anthropic',
+          models: {
+            main: 'main-model',
+            haiku: 'fast-model',
+            sonnet: 'balanced-model',
+            opus: 'large-model',
+          },
+        }],
+        providerOrder: ['provider-v5', 'claude-official', 'openai-official', 'grok-official'],
+      }),
+      'utf-8',
+    )
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    expect(report.migratedEntries).toContain('cc-haha/providers.json')
+    const migrated = JSON.parse(await fs.readFile(file, 'utf-8')) as {
+      schemaVersion: number
+      providers: Array<Record<string, unknown>>
+    }
+    expect(migrated.schemaVersion).toBe(CURRENT_PROVIDER_INDEX_SCHEMA_VERSION)
+    expect(migrated.providers[0]?.modelCatalog).toBeUndefined()
+
+    const backups = (await fs.readdir(dir))
+      .filter((name) => name.startsWith('providers.json.bak-before-migration-'))
+    expect(backups).toHaveLength(1)
+  })
+
+  test('preserves an existing model catalog while upgrading a v5 provider index', async () => {
+    const dir = path.join(tempDir, 'cc-haha')
+    const file = path.join(dir, 'providers.json')
+    const modelCatalog = [
+      {
+        id: 'catalog-model',
+        name: 'Catalog Model',
+        contextWindow: 320000,
+        supports1m: false,
+        enabled: true,
+      },
+      {
+        id: 'long-context-model',
+        supports1m: true,
+        enabled: false,
+      },
+    ]
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(
+      file,
+      JSON.stringify({
+        schemaVersion: 5,
+        activeId: 'provider-v5',
+        providers: [{
+          id: 'provider-v5',
+          presetId: 'custom',
+          name: 'Version 5 Provider',
+          apiKey: 'fake-test-token',
+          baseUrl: 'https://v5.example.test',
+          apiFormat: 'anthropic',
+          models: {
+            main: 'main-model',
+            haiku: 'fast-model',
+            sonnet: 'balanced-model',
+            opus: 'large-model',
+          },
+          modelCatalog,
+        }],
+        providerOrder: ['provider-v5', 'claude-official', 'openai-official', 'grok-official'],
+      }),
+      'utf-8',
+    )
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    const migrated = JSON.parse(await fs.readFile(file, 'utf-8')) as {
+      schemaVersion: number
+      providers: Array<{ modelCatalog?: unknown }>
+    }
+    expect(migrated.schemaVersion).toBe(CURRENT_PROVIDER_INDEX_SCHEMA_VERSION)
+    expect(migrated.providers[0]?.modelCatalog).toEqual(modelCatalog)
   })
 })
