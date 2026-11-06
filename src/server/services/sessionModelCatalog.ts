@@ -46,7 +46,12 @@ export async function listSessionModels(): Promise<SessionModelOption[]> {
   return catalog
 }
 
-export function buildSessionModelCatalog(saved: SavedProvider[], accounts: { claude: boolean; openai: boolean; grok: boolean; deepseek: boolean }, activeProviderId?: string | null, magpieModels: readonly MagpieModel[] = []): SessionModelOption[] {
+export function buildSessionModelCatalog(
+  saved: SavedProvider[],
+  accounts: { claude: boolean; openai: boolean; grok: boolean; deepseek: boolean },
+  activeProviderId?: string | null,
+  magpieModels: readonly MagpieModel[] = [],
+): SessionModelOption[] {
   const result: SessionModelOption[] = []
   const add = (providerId: string | null, providerName: string, modelId: string, modelName: string, isDefault: boolean, supportedEfforts?: readonly string[], defaultEffort?: string) => {
     if (!modelId || result.some(item => item.providerId === providerId && item.modelId === modelId)) return
@@ -71,6 +76,14 @@ export function buildSessionModelCatalog(saved: SavedProvider[], accounts: { cla
       add(provider.id, provider.name, modelId, modelId, slot === 'main', profile?.supportedReasoningEfforts ?? [], profile?.defaultReasoningEffort)
       const candidate = result.find(item => item.providerId === provider.id && item.modelId === modelId)!
       candidate.aliases = [...(candidate.aliases ?? []), slot, ...(slot === 'main' ? ['default'] : [])]
+    }
+    for (const [index, binding] of (provider.modelBindings ?? []).entries()) {
+      const base = binding.modelId.trim().replace(/(?:\[1m\]|:1m)$/i, '')
+      if (!base) continue
+      const modelId = binding.support1m ? `${base}[1m]` : base
+      const profile = resolveModelReasoningProfile(modelId, provider.apiFormat,
+        getModelReasoningCapabilityOverride(modelId, provider.models, getPresetDefaultEnv(provider.presetId)), getPresetReasoningProviderKind(provider.presetId))
+      add(provider.id, provider.name, modelId, `Custom ${index + 1}`, false, profile?.supportedReasoningEfforts ?? [], profile?.defaultReasoningEffort)
     }
     // Every model Magpie serves can run a session, not only the mapped slots.
     if (isMagpieProvider(provider)) for (const model of magpieModels) {

@@ -51,6 +51,18 @@ describe('session model catalog and strict runtime identity', () => {
     expect(catalog.map(item => item.modelId)).toContain('shared-model[1m]')
     expect(catalog.map(item => item.modelId)).toContain('shared-model')
   })
+  test('custom model bindings become runtime choices, but unbound catalog models do not', () => {
+    const configured = provider('first')
+    configured.modelBindings = [{ id: 'binding-1', modelId: 'custom-model', support1m: true }]
+    configured.modelCatalog = {
+      models: [{ id: 'catalog-model', ownedBy: 'vendor' }],
+      fetchedAt: '2026-01-01T00:00:00.000Z',
+    }
+    const catalog = buildSessionModelCatalog([configured], accounts, 'first')
+    const ids = catalog.filter(item => item.providerId === 'first').map(item => item.modelId)
+    expect(ids).toContain('custom-model[1m]')
+    expect(ids).not.toContain('catalog-model')
+  })
 })
 
 test('inherited stale effort is normalized, while an explicit unsupported effort is rejected', () => {

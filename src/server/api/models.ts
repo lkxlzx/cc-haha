@@ -344,11 +344,26 @@ async function buildActiveProviderModelList(provider: SavedProvider): Promise<Ap
     getPresetDefaultEnv(provider.presetId),
     getPresetReasoningProviderKind(provider.presetId),
   )
-  if (!isDeepSeekAccountProviderId(provider.id)) return mapped
-  return withDeepSeekAccountCatalog(
-    mapped,
-    buildDeepSeekAccountModelList(await listDeepSeekAccountModels()),
-  )
+  const models = [...mapped]
+  const known = new Set(models.map((model) => baseModelId(model.id)))
+  for (const [index, binding] of (provider.modelBindings ?? []).entries()) {
+    const id = binding.support1m ? `${baseModelId(binding.modelId)}[1m]` : binding.modelId
+    if (!id.trim() || known.has(baseModelId(id))) continue
+    known.add(baseModelId(id))
+    models.push({
+      id,
+      name: `Custom ${index + 1}`,
+      description: binding.modelId,
+      context: '',
+    })
+  }
+  if (isDeepSeekAccountProviderId(provider.id)) {
+    return withDeepSeekAccountCatalog(
+      models,
+      buildDeepSeekAccountModelList(await listDeepSeekAccountModels()),
+    )
+  }
+  return models
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────

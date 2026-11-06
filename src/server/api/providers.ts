@@ -44,6 +44,11 @@ import {
   toCcSwitchScanResult,
 } from '../services/ccSwitchImport.js'
 import { fetchProviderModels } from '../services/providerModelCatalog.js'
+import {
+  providerModelCatalogKey,
+  readProviderModelCatalogs,
+  saveProviderModelCatalog,
+} from '../services/providerModelCatalogStore.js'
 
 const providerService = new ProviderService()
 
@@ -56,6 +61,7 @@ const FetchProviderModelsSchema = z.object({
   apiKey: z.string().min(1),
   isFullUrl: z.boolean().optional(),
   proxy: ProviderProxyConfigSchema.optional(),
+  headers: z.record(z.string().min(1), z.string()).optional(),
   // `modelsUrl` is deliberately NOT accepted over HTTP. The service still
   // supports the override for internal callers, but exposing a free-form
   // endpoint on an authenticated route only widens the request surface — no
@@ -155,11 +161,18 @@ export async function handleProvidersApi(
     if (!id) {
       if (req.method === 'GET') {
         const { providers, activeId, providerOrder } = await providerService.listProviders()
+        const catalogs = await readProviderModelCatalogs()
+        const providersWithCatalogs = providers.map((provider) => ({
+          ...provider,
+          ...(catalogs[providerModelCatalogKey(provider.baseUrl)] !== undefined && {
+            modelCatalog: catalogs[providerModelCatalogKey(provider.baseUrl)],
+          }),
+        }))
         // The built-in DeepSeek account is not a saved provider, but the model
         // picker shows its alias rows like one, from the mapping the user saved.
         const deepSeekAccountModels =
           await providerService.getOfficialProviderModels(DEEPSEEK_ACCOUNT_PROVIDER_ID)
-        return Response.json({ providers, activeId, providerOrder, deepSeekAccountModels })
+        return Response.json({ providers: providersWithCatalogs, activeId, providerOrder, deepSeekAccountModels })
       }
       if (req.method === 'POST') {
         return await handleCreate(req)
@@ -303,7 +316,15 @@ async function handleFetchModels(req: Request): Promise<Response> {
   try {
     const input = FetchProviderModelsSchema.parse(body)
     // Upstream failures are reported as 200 + { ok: false }, like testProvider.
-    return Response.json(await fetchProviderModels(input))
+    const result = await fetchProviderModels(input)
+    if (result.ok) {
+      await saveProviderModelCatalog(input.baseUrl, {
+        models: result.models,
+        fetchedAt: new Date().toISOString(),
+        endpoint: result.endpoint,
+      }).catch(() => undefined)
+    }
+    return Response.json(result)
   } catch (err) {
     if (err instanceof z.ZodError) throw ApiError.badRequest(err.issues.map((i) => i.message).join('; '))
     throw err

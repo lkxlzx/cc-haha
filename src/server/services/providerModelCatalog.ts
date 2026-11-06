@@ -14,6 +14,7 @@ import {
   resolveProviderNetworkSettings,
 } from './networkSettings.js'
 import type { ProviderProxyConfig } from '../types/provider.js'
+import { resolveUpstreamHeaders } from '../proxy/upstreamHeaders.js'
 
 export type FetchedModel = {
   id: string
@@ -46,6 +47,8 @@ export type FetchProviderModelsInput = {
   modelsUrl?: string
   /** The provider's own proxy override, so the probe reaches it the way chat will. */
   proxy?: ProviderProxyConfig
+  /** Per-key headers; auth/framing names are filtered like every upstream header. */
+  headers?: Record<string, string>
 }
 
 // cc-switch's FETCH_TIMEOUT_SECS. Deliberately not networkSettings'
@@ -221,6 +224,7 @@ export async function fetchProviderModels(
         headers: {
           Authorization: `Bearer ${apiKey}`,
           Accept: 'application/json',
+          ...(input.headers ? resolveUpstreamHeaders(input.headers) : {}),
         },
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         ...proxyOptions,
