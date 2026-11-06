@@ -42,6 +42,41 @@ export type ProviderProxyConfig = {
   url?: string
 }
 
+export type ProviderKeyPoolMode = 'session_sticky' | 'round_robin' | 'failover'
+
+/** One credential in a provider's key pool. Each key may route through its own proxy. */
+export type ProviderApiKeyEntry = {
+  id: string
+  label?: string
+  apiKey: string
+  enabled: boolean
+  weight?: number
+  proxy?: ProviderProxyConfig
+  /** Upstream headers for this key only; auth/host names are rejected server-side. */
+  headers?: Record<string, string>
+}
+
+export type ProviderKeyPool = {
+  mode: ProviderKeyPoolMode
+  keys: ProviderApiKeyEntry[]
+}
+
+/** Extra routing for the legacy single API key. Key-level proxy wins over the global one. */
+export type ProviderApiKeyConfig = {
+  name?: string
+  weight?: number
+  enabled?: boolean
+  proxy?: ProviderProxyConfig
+  headers?: Record<string, string>
+}
+
+/** Additional model aliases a provider exposes beyond the four built-in role slots. */
+export type ProviderModelBinding = {
+  id: string
+  modelId: string
+  support1m?: boolean
+}
+
 export type ImageGenerationConfig = {
   model: string
   protocol?: ImageGenerationProtocol
@@ -80,6 +115,14 @@ export type SavedProvider = {
   requestCompatibility?: RequestCompatibility
   imageGeneration?: ImageGenerationConfig
   proxy?: ProviderProxyConfig
+  /** Multiple credentials for this endpoint, distributed by the server. */
+  keyPool?: ProviderKeyPool
+  /** Proxy/headers for the legacy single API key. */
+  apiKeyConfig?: ProviderApiKeyConfig
+  /** Extra role/model bindings beyond the fixed slots. */
+  modelBindings?: ProviderModelBinding[]
+  /** Cached upstream model list; schema lands with the server-side catalog. */
+  modelCatalog?: ProviderModelCatalog
   notes?: string
 }
 
@@ -102,6 +145,9 @@ export type CreateProviderInput = {
   requestCompatibility?: RequestCompatibility
   imageGeneration?: ImageGenerationConfig
   proxy?: ProviderProxyConfig
+  keyPool?: ProviderKeyPool
+  apiKeyConfig?: ProviderApiKeyConfig
+  modelBindings?: ProviderModelBinding[]
   notes?: string
 }
 
@@ -123,6 +169,9 @@ export type UpdateProviderInput = {
   requestCompatibility?: RequestCompatibility | null
   imageGeneration?: ImageGenerationConfig | null
   proxy?: ProviderProxyConfig | null
+  keyPool?: ProviderKeyPool | null
+  apiKeyConfig?: ProviderApiKeyConfig | null
+  modelBindings?: ProviderModelBinding[] | null
   notes?: string
 }
 
@@ -219,6 +268,15 @@ export type ProviderModelInfo = {
   ownedBy?: string
 }
 
+/** Upstream catalog cached per provider (server-side sidecar). */
+export type ProviderModelCatalog = {
+  models: ProviderModelInfo[]
+  fetchedAt?: string
+  endpoint?: string
+  /** Key that produced this list, so a refresh can reuse it. */
+  keyId?: string
+}
+
 export type ProviderModelsInput = {
   baseUrl: string
   apiKey: string
@@ -226,6 +284,8 @@ export type ProviderModelsInput = {
   modelsUrl?: string
   /** The form's proxy override, so the probe takes the route chat will take. */
   proxy?: ProviderProxyConfig
+  /** Per-key upstream headers; merged server-side after reserved-name checks. */
+  headers?: Record<string, string>
 }
 
 export type ProviderModelsErrorCode =

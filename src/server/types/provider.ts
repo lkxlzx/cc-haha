@@ -17,6 +17,7 @@ export const PROVIDER_OFFICIAL_MODEL_SETTINGS_SCHEMA_VERSION = 6
 export const PROVIDER_IMAGE_PROTOCOL_SCHEMA_VERSION = 7
 export const PROVIDER_DEEPSEEK_ACCOUNT_MODEL_IDS_SCHEMA_VERSION = 8
 export const PROVIDER_PROXY_CONFIG_SCHEMA_VERSION = 9
+export const PROVIDER_KEY_POOL_SCHEMA_VERSION = 10
 export const BUILT_IN_PROVIDER_IDS = [
   CLAUDE_OFFICIAL_PROVIDER_ID,
   OPENAI_OFFICIAL_PROVIDER_ID,
@@ -146,6 +147,39 @@ export const ProviderProxyConfigSchema = z.object({
 })
 export type ProviderProxyConfig = z.infer<typeof ProviderProxyConfigSchema>
 
+export const ProviderApiKeyConfigSchema = z.object({
+  name: z.string().trim().optional(),
+  weight: z.number().int().min(1).max(100).optional(),
+  enabled: z.boolean().optional(),
+  proxy: ProviderProxyConfigSchema.optional(),
+  headers: z.record(z.string().min(1), z.string()).optional(),
+}).passthrough()
+export type ProviderApiKeyConfig = z.infer<typeof ProviderApiKeyConfigSchema>
+
+export const ProviderKeyPoolEntrySchema = z.object({
+  id: z.string().min(1),
+  label: z.string().trim().optional(),
+  apiKey: z.string(),
+  enabled: z.boolean().default(true),
+  weight: z.number().int().min(1).max(100).default(1),
+  proxy: ProviderProxyConfigSchema.optional(),
+  headers: z.record(z.string().min(1), z.string()).optional(),
+}).passthrough()
+export type ProviderKeyPoolEntry = z.infer<typeof ProviderKeyPoolEntrySchema>
+
+export const ProviderKeyPoolSchema = z.object({
+  mode: z.enum(['session_sticky', 'round_robin', 'failover']).default('session_sticky'),
+  keys: z.array(ProviderKeyPoolEntrySchema).max(50).default([]),
+}).passthrough()
+export type ProviderKeyPool = z.infer<typeof ProviderKeyPoolSchema>
+
+export const ProviderModelBindingSchema = z.object({
+  id: z.string().min(1),
+  modelId: z.string().trim().min(1),
+  support1m: z.boolean().optional(),
+}).passthrough()
+export type ProviderModelBinding = z.infer<typeof ProviderModelBindingSchema>
+
 export const SavedProviderSchema = z.object({
   id: z.string(),
   presetId: z.string(),
@@ -166,6 +200,9 @@ export const SavedProviderSchema = z.object({
   requestCompatibility: RequestCompatibilitySchema.optional(),
   imageGeneration: ImageGenerationConfigSchema.optional(),
   proxy: ProviderProxyConfigSchema.optional(),
+  apiKeyConfig: ProviderApiKeyConfigSchema.optional(),
+  keyPool: ProviderKeyPoolSchema.optional(),
+  modelBindings: z.array(ProviderModelBindingSchema).optional(),
   notes: z.string().optional(),
 })
 
@@ -196,6 +233,9 @@ export const CreateProviderSchema = z.object({
   requestCompatibility: RequestCompatibilitySchema.optional(),
   imageGeneration: ImageGenerationConfigSchema.optional(),
   proxy: ProviderProxyConfigSchema.optional(),
+  apiKeyConfig: ProviderApiKeyConfigSchema.optional(),
+  keyPool: ProviderKeyPoolSchema.optional(),
+  modelBindings: z.array(ProviderModelBindingSchema).optional(),
   notes: z.string().optional(),
 })
 
@@ -217,6 +257,9 @@ export const UpdateProviderSchema = z.object({
   requestCompatibility: RequestCompatibilitySchema.nullable().optional(),
   imageGeneration: ImageGenerationConfigSchema.nullable().optional(),
   proxy: ProviderProxyConfigSchema.nullable().optional(),
+  apiKeyConfig: ProviderApiKeyConfigSchema.nullable().optional(),
+  keyPool: ProviderKeyPoolSchema.nullable().optional(),
+  modelBindings: z.array(ProviderModelBindingSchema).nullable().optional(),
   notes: z.string().optional(),
 })
 
