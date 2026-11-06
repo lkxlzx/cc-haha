@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { en } from '../i18n/locales/en'
 import {
   PROVIDER_MODELS_ERROR_KEYS,
+  filterProviderModelGroups,
   groupProviderModels,
   providerModelsErrorKey,
 } from './providerModels'
@@ -69,6 +70,26 @@ describe('groupProviderModels', () => {
 
   it('returns nothing for an empty list', () => {
     expect(groupProviderModels([], 'Other')).toEqual([])
+  })
+})
+
+describe('filterProviderModelGroups', () => {
+  it('removes models already bound elsewhere, ignoring the 1M suffix', () => {
+    const groups = groupProviderModels([
+      { id: 'model-a[1m]', ownedBy: 'vendor' },
+      { id: 'model-b', ownedBy: 'vendor' },
+      { id: 'model-c', ownedBy: 'other' },
+    ], 'Other')
+
+    const filtered = filterProviderModelGroups(groups, ['model-a', 'model-b'])
+    expect(filtered).toEqual([
+      { group: 'other', models: [{ id: 'model-c', ownedBy: 'other' }] },
+    ])
+  })
+
+  it('drops empty groups', () => {
+    const groups = groupProviderModels([{ id: 'only', ownedBy: 'vendor' }], 'Other')
+    expect(filterProviderModelGroups(groups, ['only'])).toEqual([])
   })
 })
 

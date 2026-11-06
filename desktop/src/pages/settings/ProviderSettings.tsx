@@ -10,10 +10,7 @@ import {
   ChevronUp,
   CircleAlert,
   CircleCheck,
-  CloudDownload,
   Download,
-  Eye,
-  EyeOff,
   Globe,
   GripVertical,
   Info,
@@ -40,7 +37,7 @@ import { useUIStore } from '../../stores/uiStore'
 import { useTranslation, type TranslationKey } from '../../i18n'
 import { Modal } from '@/components/ui/Modal'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
-import { FIELD_BASE_CLASSES, FIELD_SIZE_CLASSES, fieldStateClasses, Input } from '@/components/ui/Input'
+import { Input } from '@/components/ui/Input'
 import { Button } from '@/components/ui/Button'
 import { Checkbox } from '@/components/ui/Checkbox'
 import { IconButton } from '@/components/ui/IconButton'
@@ -52,7 +49,11 @@ import { SettingsPageHeader, SettingsPill } from '@/components/settings/Settings
 import { Dropdown } from '@/components/ui/Dropdown'
 import { SegmentedControl } from '@/components/ui/SegmentedControl'
 import { Tooltip } from '@/components/ui/Tooltip'
-import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ModelApiFormat, ProviderAuthStrategy, ProviderModelInfo, ProviderModelsErrorCode, ProviderProxyMode } from '../../types/provider'
+import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ModelApiFormat, ProviderAuthStrategy, ProviderModelInfo, ProviderModelsErrorCode, ProviderProxyMode, ProviderKeyPool, ProviderApiKeyEntry, ProviderApiKeyConfig, ProviderModelBinding } from '../../types/provider'
+import { normalizeKeyPoolDraft, toStoredKeyPool } from '../../lib/providerKeyPool'
+import { ProviderKeyPoolSection } from './ProviderKeyPoolSection'
+import { ProviderModelSlotsSection } from './ProviderModelSlotsSection'
+import { ProviderApiKeyLine, type ProviderApiKeyLineValue } from './ProviderApiKeyLine'
 import { groupProviderModels, providerModelsErrorKey } from '../../lib/providerModels'
 import { resolveModelApiFormat } from '../../../../src/shared/modelApiFormats'
 import { apply1mSupportToContextInput, apply1mSupportToContextInputs, getAutoCompactWindowErrorKey, getModelContextWindowErrorKey, MODEL_SLOTS, parseAutoCompactWindowInput, parseModelContextWindowsInput, type ModelContextInputs, type ModelSlot } from '../../lib/providerModelContext'
@@ -79,7 +80,6 @@ import { CcSwitchImportModal } from '../../components/settings/CcSwitchImportMod
 import { MagpieProviderDialog } from '../../components/settings/MagpieProviderDialog'
 import { MagpieConnectBanner, MagpieModelChips, MagpieStatusLine } from '../../components/settings/MagpieProviderParts'
 import { MAGPIE_PRESET_ID, isMagpieProvider, useMagpieStore } from '../../stores/magpieStore'
-import { ModelIdCombobox } from '../../components/settings/ModelIdCombobox'
 import { ProviderRequestCompatibilityFields } from '@/components/settings/ProviderRequestCompatibilityFields'
 import { compatibilityForm, invalidCompatibilityNumber, parseCompatibilityForm, parseAnthropicBudgetForm, pickOutputBudget, readCompatibilityEditorJson, writeCompatibilityJson, type RequestCompatibilityForm } from '../../lib/providerRequestCompatibility'
 import { ProviderImageGenerationFields, type ImageGenerationFormValue } from '../../components/settings/ProviderImageGenerationFields'
@@ -1163,6 +1163,16 @@ function normalizeModelMapping(models: ModelMapping): ModelMapping {
   }
 }
 
+/**
+ * New providers start with one effective model. Preset slot mappings stay as
+ * suggestions only when editing an existing record; a fresh provider must not
+ * inherit five hidden role overrides the user never chose.
+ */
+function collapseModelMappingToMain(models: ModelMapping): ModelMapping {
+  const main = models.main
+  return { main, fable: main, haiku: main, sonnet: main, opus: main }
+}
+
 function readSettingsEnvString(env: Record<string, unknown>, key: string): string | undefined {
   const value = env[key]
   if (typeof value !== 'string') return undefined
@@ -1447,7 +1457,9 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   // label that says what it is for.
   const presetLabel = (preset: ProviderPreset) =>
     preset.id === 'custom' ? t('settings.providers.customPreset') : preset.name
-  const initialModels = stripModel1mMarkers(provider?.models ?? initialPreset.defaultModels)
+  const initialModels = stripModel1mMarkers(
+    provider?.models ?? collapseModelMappingToMain(initialPreset.defaultModels),
+  )
   const initialImageGeneration = provider
     ? provider.imageGeneration
     : initialPreset.defaultImageGeneration
@@ -1475,6 +1487,10 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   const [authStrategy, setAuthStrategy] = useState<ProviderAuthStrategy>(provider?.authStrategy ?? getPresetAuthStrategy(initialPreset))
   const [apiKey, setApiKey] = useState(provider?.apiKey ?? '')
   const [showApiKey, setShowApiKey] = useState(false)
+  const [apiKeyConfig, setApiKeyConfig] = useState<ProviderApiKeyConfig>(() => provider?.apiKeyConfig ?? {})
+  const [keyPool, setKeyPool] = useState<ProviderKeyPool>(() => normalizeKeyPoolDraft(provider?.keyPool))
+  const hasPoolCredentials = keyPool.keys.some((key) => key.enabled !== false && key.apiKey.trim())
+  const hasLegacyCredentials = apiKeyConfig.enabled !== false && Boolean(apiKey.trim())
   const [proxyMode, setProxyMode] = useState<ProviderProxyMode>(provider?.proxy?.mode ?? 'follow_global')
   const [proxyUrl, setProxyUrl] = useState(provider?.proxy?.url ?? '')
   // The phone receives only the saved mode: proxy URLs can contain credentials.
@@ -1484,6 +1500,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   const [notes, setNotes] = useState(provider?.notes ?? '')
   const [compatibility, setCompatibility] = useState(() => compatibilityForm(provider?.requestCompatibility))
   const [models, setModels] = useState<ModelMapping>(initialModels)
+  const [modelBindings, setModelBindings] = useState<ProviderModelBinding[]>(() => provider?.modelBindings ?? [])
   const [model1mSupport, setModel1mSupport] = useState<Model1mSupport>(initialModel1mSupport)
   const [modelContextInputs, setModelContextInputs] = useState<ModelContextInputs>(initialModelContextInputs)
   const [autoCompactWindow, setAutoCompactWindow] = useState(
@@ -1508,7 +1525,9 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   const [credentialRequired, setCredentialRequired] = useState(false)
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null)
   const [isTesting, setIsTesting] = useState(false)
-  const [fetchedModels, setFetchedModels] = useState<ProviderModelInfo[] | null>(null)
+  const [fetchedModels, setFetchedModels] = useState<ProviderModelInfo[] | null>(
+    provider?.modelCatalog?.models ?? null,
+  )
   const [modelsErrorCode, setModelsErrorCode] = useState<ProviderModelsErrorCode | null>(null)
   const [modelsErrorMessage, setModelsErrorMessage] = useState<string | null>(null)
   const [isFetchingModels, setIsFetchingModels] = useState(false)
@@ -1645,7 +1664,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
     })
     setApiFormat(preset.apiFormat ?? 'anthropic')
     setAuthStrategy(getPresetAuthStrategy(preset))
-    const nextModels = stripModel1mMarkers(preset.defaultModels)
+    const nextModels = stripModel1mMarkers(collapseModelMappingToMain(preset.defaultModels))
     const nextModel1mSupport = getInitialModel1mSupport(preset.defaultModels)
     const nextModelContextInputs = apply1mSupportToContextInputs(
       getModelContextInputs(nextModels, preset),
@@ -1668,7 +1687,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   const modelContextWindowErrorSlots = MODEL_SLOTS.filter((slot) => getModelContextWindowErrorKey(modelContextInputs[slot]))
   const compatibilityInvalid = invalidCompatibilityNumber(compatibility.maxOutputTokens)
     || (apiFormat !== 'anthropic' && invalidCompatibilityNumber(compatibility.outputTokenLimit))
-  const canSubmit = !compatibilityInvalid && !(!keepRemoteProxy && proxyMode === 'manual' && !isValidHttpProxyUrl(proxyUrl.trim())) && name.trim() && baseUrl.trim() && (mode === 'edit' || !requiresApiKey || apiKey.trim()) && models.main.trim() && (!imageGeneration.enabled || imageGeneration.model.trim()) && !settingsJsonError && !autoCompactWindowErrorKey && modelContextWindowErrorSlots.length === 0
+  const canSubmit = !compatibilityInvalid && !(!keepRemoteProxy && proxyMode === 'manual' && !isValidHttpProxyUrl(proxyUrl.trim())) && name.trim() && baseUrl.trim() && (mode === 'edit' || !requiresApiKey || hasLegacyCredentials || hasPoolCredentials) && models.main.trim() && (!imageGeneration.enabled || imageGeneration.model.trim()) && !settingsJsonError && !autoCompactWindowErrorKey && modelContextWindowErrorSlots.length === 0
   const normalizedBaseUrl = normalizeProviderBaseUrl(baseUrl)
   const isPresetDefaultEndpoint = normalizedBaseUrl === normalizeProviderBaseUrl(selectedPreset.baseUrl)
   const apiKeyUrl = isPresetDefaultEndpoint ? selectedPreset.apiKeyUrl?.trim() : undefined
@@ -1782,6 +1801,35 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   const handleApiKeyChange = (value: string) => {
     setApiKey(value)
     setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, value, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas, supportsNestedToolResultMedia))
+  }
+  const handleLegacyKeyLineChange = (patch: Partial<ProviderApiKeyLineValue>) => {
+    if (patch.apiKey !== undefined) handleApiKeyChange(patch.apiKey)
+    if ('proxy' in patch || 'headers' in patch || 'label' in patch || 'weight' in patch || 'enabled' in patch) {
+      setApiKeyConfig((current) => {
+        const next = { ...current }
+        if ('label' in patch) {
+          if (patch.label?.trim()) next.name = patch.label.trim()
+          else delete next.name
+        }
+        if ('weight' in patch) {
+          if (patch.weight !== undefined) next.weight = patch.weight
+          else delete next.weight
+        }
+        if ('enabled' in patch) {
+          if (patch.enabled === false) next.enabled = false
+          else delete next.enabled
+        }
+        if ('proxy' in patch) {
+          if (patch.proxy) next.proxy = patch.proxy
+          else delete next.proxy
+        }
+        if ('headers' in patch) {
+          if (patch.headers && Object.keys(patch.headers).length > 0) next.headers = patch.headers
+          else delete next.headers
+        }
+        return next
+      })
+    }
   }
   const handleCompatibilityChange = (value: RequestCompatibilityForm) => {
     setCompatibility(value)
@@ -1946,6 +1994,25 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
       if (modelsRequestRef.current === requestId) setIsFetchingModels(false)
     }
   }
+  const canTestKeyPool = Boolean(baseUrl.trim() && models.main.trim())
+  const handleTestKey = async (key: ProviderApiKeyEntry): Promise<ProviderTestResult | null> => {
+    if (!canTestKeyPool || !key.apiKey.trim()) return null
+    const probeProxy = key.proxy?.mode === 'manual' && key.proxy.url?.trim()
+      ? { mode: 'manual' as const, url: key.proxy.url.trim() }
+      : key.proxy?.mode === 'direct'
+        ? { mode: 'direct' as const }
+        : undefined
+    return testConfig({
+      baseUrl: baseUrl.trim(),
+      apiKey: key.apiKey.trim(),
+      modelId: models.main.trim(),
+      authStrategy,
+      apiFormat,
+      supportsNestedToolResultMedia,
+      ...(probeProxy && { proxy: probeProxy }),
+      presetId: selectedPreset.id,
+    })
+  }
   const modelsErrorText = modelsErrorCode ? t(providerModelsErrorKey(modelsErrorCode)) : null
   // The server keeps the upstream's own wording, which is the only thing that
   // separates a 200-cloaked auth failure (智谱 answers `{"msg":"身份验证失败。"}`
@@ -2001,6 +2068,35 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
     if (!canSubmit || isSubmitting) return
     const storedCompatibility = apiFormat === 'anthropic' ? parseAnthropicBudgetForm(compatibility) : parseCompatibilityForm(compatibility)
     const normalizedModels = normalizeModelMapping(models)
+    const storedKeyPool = toStoredKeyPool(keyPool)
+    const hasLegacyHeaders = apiKeyConfig.headers !== undefined && Object.keys(apiKeyConfig.headers).length > 0
+    const storedApiKeyConfig = (
+      apiKeyConfig.name?.trim()
+      || apiKeyConfig.weight !== undefined
+      || apiKeyConfig.enabled === false
+      || apiKeyConfig.proxy
+      || hasLegacyHeaders
+    )
+      ? {
+          ...(apiKeyConfig.name?.trim() && { name: apiKeyConfig.name.trim() }),
+          ...(apiKeyConfig.weight !== undefined && { weight: apiKeyConfig.weight }),
+          ...(apiKeyConfig.enabled === false && { enabled: false }),
+          ...(apiKeyConfig.proxy && { proxy: apiKeyConfig.proxy }),
+          ...(hasLegacyHeaders && { headers: apiKeyConfig.headers }),
+        }
+      : undefined
+    const storedModelBindings = modelBindings
+      .map((binding) => ({
+        ...binding,
+        modelId: binding.modelId.trim(),
+      }))
+      .filter((binding) => binding.modelId)
+    // The legacy single-key path still drives CLI env until the server-side key
+    // pool lands. Fall back to the first enabled pool key so saving a pool-only
+    // provider does not blank the provider.
+    const effectiveApiKey = (apiKeyConfig.enabled !== false ? apiKey.trim() : '') || keyPool.keys.find(
+      (key) => key.enabled !== false && key.apiKey.trim(),
+    )?.apiKey.trim() || ''
     const parsedAutoCompactWindow = parseAutoCompactWindowInput(autoCompactWindow)
     const parsedModelContextWindows = buildModelContextWindows(models, modelContextInputs)
     const storedModel1mSupport = hasAnyModel1mSupport(model1mSupport)
@@ -2046,7 +2142,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
         await createProvider({
           presetId: selectedPreset.id,
           name: name.trim(),
-          apiKey: apiKey.trim(),
+          apiKey: effectiveApiKey,
           authStrategy,
           baseUrl: baseUrl.trim(),
           apiFormat,
@@ -2060,6 +2156,9 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
           supportsNestedToolResultMedia,
           ...(storedImageGeneration !== undefined && { imageGeneration: storedImageGeneration }),
           ...(storedProxy && { proxy: storedProxy }),
+          ...(storedKeyPool && { keyPool: storedKeyPool }),
+          ...(storedApiKeyConfig && { apiKeyConfig: storedApiKeyConfig }),
+          ...(storedModelBindings.length > 0 && { modelBindings: storedModelBindings }),
           notes: notes.trim() || undefined,
         })
       } else if (provider) {
@@ -2080,9 +2179,12 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
           supportsNestedToolResultMedia,
           imageGeneration: storedImageGeneration ?? null,
           ...(!keepRemoteProxy && { proxy: storedProxy }),
+          keyPool: storedKeyPool ?? null,
+          apiKeyConfig: storedApiKeyConfig ?? null,
+          modelBindings: storedModelBindings.length > 0 ? storedModelBindings : null,
           notes: notes.trim() || undefined,
         }
-        if (apiKey.trim()) input.apiKey = apiKey.trim()
+        if (effectiveApiKey) input.apiKey = effectiveApiKey
         await updateProvider(provider.id, input)
       }
       await fetchSettings()
@@ -2226,33 +2328,43 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
         </div>
 
         <div className="flex flex-col gap-1">
-          <label htmlFor="provider-api-key" className={FORM_FIELD_LABEL}>
+          <span className={FORM_FIELD_LABEL}>
             {t('settings.providers.apiKey')}
-            {mode === 'create' && requiresApiKey && <span className="text-[var(--color-error)] ml-0.5">*</span>}
-          </label>
-          <div className="relative">
-            <input
-              id="provider-api-key"
-              autoComplete="off"
-              spellCheck={false}
-              type={showApiKey ? 'text' : 'password'}
-              value={apiKey}
-              onChange={(e) => handleApiKeyChange(e.target.value)}
-              placeholder="sk-..."
-              className={cx(FIELD_BASE_CLASSES, FIELD_SIZE_CLASSES.lg, fieldStateClasses(false), 'pr-10')}
-            />
-            <IconButton
-              icon={showApiKey
-                ? <EyeOff size={14} strokeWidth={1.75} aria-hidden="true" />
-                : <Eye size={14} strokeWidth={1.75} aria-hidden="true" />}
-              label={t(showApiKey ? 'settings.providers.hideApiKey' : 'settings.providers.showApiKey')}
-              showTooltip={false}
-              size="sm"
-              tone="muted"
-              onClick={() => setShowApiKey((visible) => !visible)}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2"
-            />
-          </div>
+            {mode === 'create' && requiresApiKey && !hasLegacyCredentials && !hasPoolCredentials && <span className="text-[var(--color-error)] ml-0.5">*</span>}
+          </span>
+          <ProviderApiKeyLine
+            inputId="provider-api-key"
+            value={{
+              apiKey,
+              enabled: apiKeyConfig.enabled !== false,
+              ...(apiKeyConfig.name !== undefined && { label: apiKeyConfig.name }),
+              ...(apiKeyConfig.weight !== undefined && { weight: apiKeyConfig.weight }),
+              ...(apiKeyConfig.proxy && { proxy: apiKeyConfig.proxy }),
+              ...(apiKeyConfig.headers && { headers: apiKeyConfig.headers }),
+            }}
+            displayName={apiKeyConfig.name?.trim() || t('settings.providers.keyPoolLegacyName')}
+            ariaLabel={t('settings.providers.apiKey')}
+            proxyAriaLabel={t('settings.providers.keyPoolLegacyProxyAria')}
+            showMeta
+            showEnabled
+            onRemove={undefined}
+            onClear={() => {
+              handleApiKeyChange('')
+              setApiKeyConfig({})
+            }}
+            clearLabel={t('settings.providers.keyPoolClear')}
+            showSecret={showApiKey}
+            onShowSecretChange={setShowApiKey}
+            canTest={canTestKeyPool}
+            onTest={() => handleTestKey({
+              id: 'legacy',
+              apiKey,
+              enabled: apiKeyConfig.enabled !== false,
+              ...(apiKeyConfig.proxy && { proxy: apiKeyConfig.proxy }),
+              ...(apiKeyConfig.headers && { headers: apiKeyConfig.headers }),
+            })}
+            onChange={handleLegacyKeyLineChange}
+          />
         </div>
 
         {(apiKeyUrl || promoText) && (
@@ -2285,91 +2397,39 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
           </div>
         )}
 
-        {/* Model Mapping */}
-        <div>
-          <div className="mb-2 flex items-center justify-between gap-2">
-            <span className={FORM_SECTION_LABEL}>{t('settings.providers.modelMapping')}</span>
-            {!browserMode && <Button
-              variant="secondary"
-              size="base"
-              onClick={handleFetchModels}
-              disabled={!canFetchModels}
-              loading={isFetchingModels}
-              icon={<CloudDownload size={14} strokeWidth={1.75} aria-hidden="true" />}
-            >
-              {t('settings.providers.fetchModels')}
-            </Button>}
-          </div>
-          {browserMode ? null : !hasModelsApiKey ? (
-            <p className={cx(FORM_HINT, 'mb-2')}>{t('settings.providers.fetchModelsApiKeyHint')}</p>
-          ) : !hasModelsBaseUrl ? (
-            <p className={cx(FORM_HINT, 'mb-2')}>{t('settings.providers.fetchModelsHint')}</p>
-          ) : modelsErrorCode ? (
-            <div role="alert" className="mb-2 flex flex-col gap-0.5">
-              <p className="text-[11px] text-[var(--color-error)]">{modelsErrorText}</p>
-              {modelsErrorUpstream && (
-                <p className="break-words text-[11px] text-[var(--color-text-tertiary)]">
-                  {t('settings.providers.fetchModelsErrorUpstream')} {modelsErrorUpstream}
-                </p>
-              )}
-            </div>
-          ) : fetchedModels && fetchedModels.length === 0 ? (
-            <p className={cx(FORM_HINT, 'mb-2')}>{t('settings.providers.fetchModelsEmpty')}</p>
-          ) : fetchedModels ? (
-            <p className="mb-2 text-[11px] text-[var(--color-text-secondary)]">
-              {t('settings.providers.fetchModelsLoaded', { count: fetchedModels.length })}
-            </p>
-          ) : (
-            <p className={cx(FORM_HINT, 'mb-2')}>{t('settings.providers.fetchModelsSupportHint')}</p>
-          )}
-          <div className={browserMode ? "grid grid-cols-1 sm:grid-cols-2 gap-2" : "grid grid-cols-2 gap-2"}>
-            {MODEL_SLOTS.map((slot) => {
-              const label = t(MODEL_SLOT_LABEL_KEYS[slot])
-              const pickLabel = t('settings.providers.fetchModelsPick', { label })
-              return (
-                <div key={slot} className="min-w-0">
-                  <ModelIdCombobox
-                    label={label}
-                    required={slot === 'main'}
-                    value={models[slot] ?? ''}
-                    onChange={(value) => handleModelChange(slot, value)}
-                    placeholder={
-                      // Fable is the one slot that does not fall back to the
-                      // main model: an empty value leaves the choice to the
-                      // runtime, which resolves it to the provider's Opus-tier
-                      // model (third-party) or a real Fable model (official).
-                      slot === 'main'
-                        ? t('settings.providers.modelIdPlaceholder')
-                        : slot === 'fable'
-                          ? t('settings.providers.fableModelPlaceholder')
-                          : t('settings.providers.sameAsMain')
-                    }
-                    groups={modelPickerGroups}
-                    pickerLabel={pickLabel}
-                    noMatchesLabel={t('model.noMatches')}
-                    moreResultsLabel={t('settings.providers.fetchModelsMoreResults')}
-                  />
-                  <Tooltip content={t('settings.providers.model1mSupportTooltip')} placement="bottom-start">
-                    <label className="mt-1 inline-flex h-6 w-fit cursor-pointer items-center gap-1.5 rounded-[var(--radius-sm)] px-1 text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
-                      {/* Named per slot rather than by the shared visible "1M" text. */}
-                      <input
-                        type="checkbox"
-                        checked={model1mSupport[slot]}
-                        onChange={(e) => handleModel1mSupportChange(slot, e.target.checked)}
-                        aria-label={t('settings.providers.model1mSupportAria', { slot })}
-                        className="h-3.5 w-3.5 shrink-0 rounded-[var(--radius-xs)] border-[var(--color-border-strong)] accent-[var(--color-brand)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
-                      />
-                      <span>{t('settings.providers.model1mSupportShort')}</span>
-                    </label>
-                  </Tooltip>
-                </div>
-              )
-            })}
-          </div>
-          <p className={cx(FORM_HINT, 'mt-2')}>
-            {t('settings.providers.model1mSupportHint')}
-          </p>
-        </div>
+        <ProviderKeyPoolSection
+          value={keyPool}
+          onChange={setKeyPool}
+          canTest={canTestKeyPool}
+          onTestKey={handleTestKey}
+        />
+
+        <ProviderModelSlotsSection
+          models={models}
+          model1mSupport={model1mSupport}
+          bindings={modelBindings}
+          onBindingsChange={setModelBindings}
+          labels={{
+            main: t(MODEL_SLOT_LABEL_KEYS.main),
+            fable: t(MODEL_SLOT_LABEL_KEYS.fable),
+            haiku: t(MODEL_SLOT_LABEL_KEYS.haiku),
+            sonnet: t(MODEL_SLOT_LABEL_KEYS.sonnet),
+            opus: t(MODEL_SLOT_LABEL_KEYS.opus),
+          }}
+          onModelChange={handleModelChange}
+          onModel1mSupportChange={handleModel1mSupportChange}
+          fetchedModels={fetchedModels}
+          modelPickerGroups={modelPickerGroups}
+          canFetchModels={canFetchModels}
+          hasModelsBaseUrl={hasModelsBaseUrl}
+          hasModelsApiKey={hasModelsApiKey}
+          isFetchingModels={isFetchingModels}
+          modelsErrorCode={modelsErrorCode}
+          modelsErrorText={modelsErrorText}
+          modelsErrorUpstream={modelsErrorUpstream}
+          onFetchModels={handleFetchModels}
+          browserMode={browserMode}
+        />
 
         <Input label={t('settings.providers.notes')} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder={t('settings.providers.notesPlaceholder')} />
 

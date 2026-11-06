@@ -60,7 +60,14 @@ describe('DeepSeek preset defaults', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Add Model/ }))
     const dialog = within(screen.getByRole('dialog'))
     fireEvent.click(dialog.getByRole('button', { name: 'DeepSeek' }))
-    expect(dialog.getAllByDisplayValue('deepseek-flash')).toHaveLength(5)
+    // New providers start on one effective model; role slots are collapsed
+    // until the user explicitly opens them.
+    expect(dialog.getAllByDisplayValue('deepseek-flash')).toHaveLength(1)
+    expect(dialog.getAllByRole('checkbox', { name: /1M/ })).toHaveLength(1)
+    fireEvent.click(dialog.getByRole('button', { name: /Role overrides/ }))
+    // Role fields that follow the effective model stay empty instead of
+    // duplicating its value.
+    expect(dialog.getAllByDisplayValue('deepseek-flash')).toHaveLength(1)
     const contextCheckboxes = dialog.getAllByRole('checkbox', { name: /1M/ })
     expect(contextCheckboxes).toHaveLength(5)
     for (const checkbox of contextCheckboxes) expect(checkbox).toBeChecked()
@@ -192,8 +199,8 @@ describe('active sponsor providers', () => {
     expect(within(dialog.getByRole('button', { name: 'Atlas Cloud' })).queryByLabelText('Sponsor')).not.toBeInTheDocument()
     fireEvent.click(sponsor)
     expect(dialog.getByDisplayValue('https://agent.aruhub.com')).toBeInTheDocument()
-    expect(dialog.getAllByDisplayValue('claude-opus-5-5')).toHaveLength(2)
-    expect(dialog.getAllByDisplayValue('claude-sonnet-5-5')).toHaveLength(2)
+    expect(dialog.getAllByDisplayValue('claude-opus-5-5')).toHaveLength(1)
+    expect(dialog.queryByDisplayValue('claude-sonnet-5-5')).not.toBeInTheDocument()
     const offer = dialog.getByRole('button', { name: /注册即送 1 美元全模型通用额度/ })
     fireEvent.click(offer)
     expect(open).toHaveBeenCalledWith('https://aruhub.com/sign-up?aff=Z54g')
@@ -211,7 +218,7 @@ describe('active sponsor providers', () => {
       apiFormat: 'anthropic',
       authStrategy: 'api_key',
       apiKey: 'fake-aruhub-key',
-      models: { main: 'claude-opus-5-5', haiku: 'claude-sonnet-5-5', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5' },
+      models: { main: 'claude-opus-5-5', fable: 'claude-opus-5-5', haiku: 'claude-opus-5-5', sonnet: 'claude-opus-5-5', opus: 'claude-opus-5-5' },
     })))
   })
 
@@ -262,9 +269,9 @@ describe('active sponsor providers', () => {
 
     fireEvent.click(sponsor)
     expect(dialog.getByDisplayValue('https://modelflare.dev')).toBeInTheDocument()
-    expect(dialog.getAllByDisplayValue('claude-opus-5-5')).toHaveLength(2)
-    expect(dialog.getByDisplayValue('claude-sonnet-5-5')).toBeInTheDocument()
-    expect(dialog.getByDisplayValue('claude-haiku-5-5')).toBeInTheDocument()
+    expect(dialog.getAllByDisplayValue('claude-opus-5-5')).toHaveLength(1)
+    expect(dialog.queryByDisplayValue('claude-sonnet-5-5')).not.toBeInTheDocument()
+    expect(dialog.queryByDisplayValue('claude-haiku-5-5')).not.toBeInTheDocument()
     expect(dialog.getByRole('button', { name: 'Fetch models' })).toBeDisabled()
     fireEvent.click(dialog.getByRole('button', { name: /Get API Key/ }))
     expect(open).toHaveBeenCalledWith('https://modelflare.dev/sign-up?utm_source=github&utm_campaign=cchaha')
@@ -283,11 +290,11 @@ describe('active sponsor providers', () => {
       authStrategy: 'auth_token',
       apiKey: 'fake-modelflare-key',
       models: {
-        main: 'claude-opus-5-5', haiku: 'claude-haiku-5-5',
-        sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5',
+        main: 'claude-opus-5-5', fable: 'claude-opus-5-5', haiku: 'claude-opus-5-5',
+        sonnet: 'claude-opus-5-5', opus: 'claude-opus-5-5',
       },
       modelContextWindows: {
-        'claude-opus-5-5': 1000000, 'claude-sonnet-5-5': 1000000, 'claude-haiku-5-5': 1000000,
+        'claude-opus-5-5': 1000000,
       },
     })))
   })
@@ -662,8 +669,8 @@ describe('OpenCode Go provider', () => {
     fireEvent.click(dialog.getByRole('button', { name: 'OpenCode Go' }))
 
     expect(dialog.getByDisplayValue('https://opencode.ai/zen/go/v1')).toBeInTheDocument()
-    expect(dialog.getAllByDisplayValue('glm-5.3')).toHaveLength(3)
-    expect(dialog.getByDisplayValue('glm-5.3-flash')).toBeInTheDocument()
+    expect(dialog.getAllByDisplayValue('glm-5.3')).toHaveLength(1)
+    expect(dialog.queryByDisplayValue('glm-5.3-flash')).not.toBeInTheDocument()
 
     fireEvent.change(dialog.getAllByPlaceholderText('sk-...')[0]!, { target: { value: 'fake-opencode-key' } })
     fireEvent.click(dialog.getByRole('button', { name: 'Add' }))
@@ -673,7 +680,7 @@ describe('OpenCode Go provider', () => {
       apiFormat: 'openai_chat',
       authStrategy: 'api_key',
       apiKey: 'fake-opencode-key',
-      models: { main: 'glm-5.3', haiku: 'glm-5.3-flash', sonnet: 'glm-5.3', opus: 'glm-5.3' },
+      models: { main: 'glm-5.3', fable: 'glm-5.3', haiku: 'glm-5.3', sonnet: 'glm-5.3', opus: 'glm-5.3' },
     })))
   })
 
@@ -787,9 +794,9 @@ describe('OpenRouter provider', () => {
     // The root, not /api/v1 — the CLI appends /v1/messages itself.
     expect(dialog.getByDisplayValue('https://openrouter.ai/api')).toBeInTheDocument()
     // Main and Sonnet share the balanced default; Haiku and Opus stay distinct.
-    expect(dialog.getAllByDisplayValue('anthropic/claude-sonnet-5.5')).toHaveLength(2)
-    expect(dialog.getByDisplayValue('anthropic/claude-haiku-5.5')).toBeInTheDocument()
-    expect(dialog.getByDisplayValue('anthropic/claude-opus-5.5')).toBeInTheDocument()
+    expect(dialog.getAllByDisplayValue('anthropic/claude-sonnet-5.5')).toHaveLength(1)
+    expect(dialog.queryByDisplayValue('anthropic/claude-haiku-5.5')).not.toBeInTheDocument()
+    expect(dialog.queryByDisplayValue('anthropic/claude-opus-5.5')).not.toBeInTheDocument()
 
     fireEvent.change(dialog.getAllByPlaceholderText('sk-...')[0]!, { target: { value: 'sk-or-v1-fake' } })
     fireEvent.click(dialog.getByRole('button', { name: 'Add' }))
@@ -801,9 +808,10 @@ describe('OpenRouter provider', () => {
       apiKey: 'sk-or-v1-fake',
       models: {
         main: 'anthropic/claude-sonnet-5.5',
-        haiku: 'anthropic/claude-haiku-5.5',
+        fable: 'anthropic/claude-sonnet-5.5',
+        haiku: 'anthropic/claude-sonnet-5.5',
         sonnet: 'anthropic/claude-sonnet-5.5',
-        opus: 'anthropic/claude-opus-5.5',
+        opus: 'anthropic/claude-sonnet-5.5',
       },
     })))
   })

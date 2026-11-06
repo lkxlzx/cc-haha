@@ -226,6 +226,28 @@ function buildMagpieProviderModels(
   return [...rows, ...buildProviderModels(provider, labels).filter((row) => !listed.has(row.id))]
 }
 
+/**
+ * Slot models plus explicitly bound models. The upstream catalog is only a
+ * source for the settings picker; a model must be bound to a role/binding
+ * before it becomes selectable in the main window.
+ */
+function buildBoundProviderModels(
+  provider: SavedProvider,
+  labels: Record<ModelSlot, string>,
+): ModelInfo[] {
+  const rows = buildProviderModels(provider, labels)
+  const known = new Set(rows.map((model) => baseModelId(model.id)))
+  for (const [index, binding] of (provider.modelBindings ?? []).entries()) {
+    const base = baseModelId(binding.modelId)
+    if (!base) continue
+    const id = binding.support1m ? `${base}[1m]` : base
+    if (known.has(base)) continue
+    known.add(base)
+    rows.push(buildProviderModelRow(provider, id, id, `Custom ${index + 1}`))
+  }
+  return rows
+}
+
 function buildProviderModelRow(
   provider: SavedProvider,
   id: string,
@@ -309,7 +331,7 @@ function buildProviderChoices(
       isDefault: activeId === provider.id,
       models: isMagpieProvider(provider) && magpieCatalog?.length
         ? buildMagpieProviderModels(provider, labels, magpieCatalog, describeMagpieModel)
-        : buildProviderModels(provider, labels),
+        : buildBoundProviderModels(provider, labels),
     })
   }
 

@@ -9,6 +9,24 @@ export type ProviderModelGroup = {
   models: ProviderModelInfo[]
 }
 
+export function modelBaseId(id: string): string {
+  return id.trim().replace(/\[1m\]$/i, '').replace(/:1m$/i, '').trim()
+}
+
+/** Drops models already bound elsewhere so a dropdown cannot select the same model twice. */
+export function filterProviderModelGroups(
+  groups: readonly ProviderModelGroup[],
+  excludedModelIds: Iterable<string>,
+): ProviderModelGroup[] {
+  const excluded = new Set([...excludedModelIds].map(modelBaseId).filter(Boolean))
+  return groups
+    .map((group) => ({
+      ...group,
+      models: group.models.filter((model) => !excluded.has(modelBaseId(model.id))),
+    }))
+    .filter((group) => group.models.length > 0)
+}
+
 /**
  * Buckets a fetched model list by `ownedBy`.
  *
@@ -39,7 +57,7 @@ export function groupProviderModels(
 
   return [...groups.entries()]
     .map(([group, groupModels]) => ({ group, models: groupModels }))
-    .sort((a, b) => a.group.localeCompare(b.group, undefined, { sensitivity: 'base' }))
+    .sort((a, b) => a.group.localeCompare(b.group, 'en', { sensitivity: 'base' }))
 }
 
 /**

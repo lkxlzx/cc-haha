@@ -105,6 +105,48 @@ describe('ModelSelector', () => {
     }))
   })
 
+  it('does not list cached upstream catalog models that are not bound', async () => {
+    useSettingsStore.setState({ locale: 'en' })
+    useProviderStore.setState({
+      activeId: 'catalog-1', hasLoadedProviders: true, isLoading: false,
+      providers: [{
+        id: 'catalog-1', presetId: 'custom', name: 'Catalog',
+        apiFormat: 'anthropic', apiKey: 'fixture', baseUrl: 'http://127.0.0.1:1',
+        models: { main: 'model-a', haiku: 'model-a', sonnet: 'model-a', opus: 'model-a' },
+        modelCatalog: { models: [{ id: 'model-b', ownedBy: 'vendor' }] },
+      }],
+    })
+    render(<ModelSelector runtimeKey="__draft__" onRuntimeSelectionChange={vi.fn()} />)
+    await clickByRole(/, Catalog$/)
+
+    const dropdown = within(screen.getByTestId('model-selector-dropdown'))
+    expect(dropdown.queryByRole('button', { name: /model-b/ })).not.toBeInTheDocument()
+  })
+
+  it('lists models explicitly bound to the provider', async () => {
+    useSettingsStore.setState({ locale: 'en' })
+    useProviderStore.setState({
+      activeId: 'bound-1', hasLoadedProviders: true, isLoading: false,
+      providers: [{
+        id: 'bound-1', presetId: 'custom', name: 'Bound',
+        apiFormat: 'anthropic', apiKey: 'fixture', baseUrl: 'http://127.0.0.1:1',
+        models: { main: 'model-a', haiku: 'model-a', sonnet: 'model-a', opus: 'model-a' },
+        modelBindings: [{ id: 'binding-1', modelId: 'model-b', support1m: false }],
+        modelCatalog: { models: [{ id: 'model-b', ownedBy: 'vendor' }, { id: 'model-c', ownedBy: 'vendor' }] },
+      }],
+    })
+    const runtimeChange = vi.fn()
+    render(<ModelSelector runtimeKey="__draft__" onRuntimeSelectionChange={runtimeChange} />)
+    await clickByRole(/, Bound$/)
+
+    const dropdown = within(screen.getByTestId('model-selector-dropdown'))
+    const bindingRow = dropdown.getByRole('button', { name: /Custom 1/ })
+    // The model id is the primary line; the binding name is the subtitle, the
+    // same order fixed-slot rows use.
+    expect(bindingRow.textContent).toBe('model-bCustom 1')
+    expect(dropdown.queryByRole('button', { name: /model-c/ })).not.toBeInTheDocument()
+  })
+
   it('shows the configured default for an opened session whose saved provider was removed', () => {
     useSettingsStore.setState({ locale: 'en', effortLevel: 'high' })
     useProviderStore.setState({
