@@ -451,6 +451,56 @@ describe('providerRuntimeEnv', () => {
     expect(env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBeUndefined()
   })
 
+  test('forces the local proxy when a provider configures a key pool', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'pooled-provider',
+      providers: [{
+        id: 'pooled-provider',
+        presetId: 'custom',
+        name: 'Pooled',
+        apiKey: '',
+        baseUrl: 'https://pooled.example.com',
+        apiFormat: 'anthropic',
+        models: { main: 'm', haiku: 'm', sonnet: 'm', opus: 'm' },
+        keyPool: {
+          mode: 'session_sticky',
+          keys: [
+            { id: 'a', apiKey: 'sk-a', enabled: true, weight: 1 },
+            { id: 'b', apiKey: 'sk-b', enabled: true, weight: 1 },
+          ],
+        },
+      }],
+    })
+
+    const env = readActiveProviderManagedEnv(tmpDir, { serverPort: 4321 })
+    expect(env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:4321/proxy',
+      ANTHROPIC_API_KEY: 'proxy-managed',
+    })
+  })
+
+  test('forces the local proxy when the legacy key has its own proxy or headers', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'legacy-routed',
+      providers: [{
+        id: 'legacy-routed',
+        presetId: 'custom',
+        name: 'Legacy routed',
+        apiKey: 'sk-legacy',
+        baseUrl: 'https://legacy.example.com',
+        apiFormat: 'anthropic',
+        models: { main: 'm', haiku: 'm', sonnet: 'm', opus: 'm' },
+        apiKeyConfig: { headers: { 'X-Trace': '1' } },
+      }],
+    })
+
+    const env = readActiveProviderManagedEnv(tmpDir, { serverPort: 4321 })
+    expect(env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:4321/proxy',
+      ANTHROPIC_API_KEY: 'proxy-managed',
+    })
+  })
+
   test('honors explicitly enabled tool search for native Anthropic providers', async () => {
     await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
       schemaVersion: PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,

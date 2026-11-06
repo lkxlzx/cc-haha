@@ -17,6 +17,12 @@ import { createGunzip, createInflate } from 'node:zlib'
 
 import { ProviderService } from '../services/providerService.js'
 import { diagnosticsService } from '../services/diagnosticsService.js'
+import {
+  markProviderKeyFailure,
+  markProviderKeySuccess,
+  selectProviderKey,
+  shouldCoolDownForStatus,
+} from '../services/providerKeyPool.js'
 import type { ProviderAuthStrategy } from '../types/provider.js'
 import { resolvePromptCacheKey } from './promptCacheKey.js'
 import {
@@ -259,9 +265,29 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
 
   const isStream = body.stream === true
   const baseUrl = config.baseUrl.replace(/\/+$/, '')
-  const networkSettings = resolveProviderNetworkSettings(await loadNetworkSettings(), config.proxy)
-  const traceContext = buildProxyTraceContext(req, config, body)
   const inboundSessionId = req.headers.get('x-claude-code-session-id')
+  const selectedKey = selectProviderKey(config.keyPool, {
+    providerId: config.id,
+    sessionId: inboundSessionId,
+  })
+  if (config.keyPool.keys.length > 0 && !selectedKey) {
+    return Response.json(
+      {
+        type: 'error',
+        error: {
+          type: 'authentication_error',
+          message: `Provider "${config.name}" has no enabled API key in its key pool`,
+        },
+      },
+      { status: 401 },
+    )
+  }
+  const effectiveApiKey = selectedKey?.apiKey ?? config.apiKey
+  const networkSettings = resolveProviderNetworkSettings(
+    await loadNetworkSettings(),
+    selectedKey?.proxy ?? config.proxy,
+  )
+  const traceContext = buildProxyTraceContext(req, config, body)
   const promptCacheKey = resolvePromptCacheKey(body, inboundSessionId)
   const requestOptions: RequestCompatibilityOptions = {
     requestCompatibility: config.requestCompatibility,
@@ -275,7 +301,20 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
   const modelApiFormat = modelApiRule?.apiFormat
   const apiFormat = modelApiFormat ?? config.apiFormat
   const upstreamBaseUrl = resolveModelApiBaseUrl(baseUrl, modelApiRule)
-  const upstreamHeaders = resolveUpstreamHeaders(config.upstreamHeaders, { sessionId: inboundSessionId })
+  const upstreamHeaders = {
+    ...resolveUpstreamHeaders(config.upstreamHeaders, { sessionId: inboundSessionId }),
+    ...resolveUpstreamHeaders(selectedKey?.headers, { sessionId: inboundSessionId }),
+  }
+
+  const finalizeKeyResult = (response: Response): Response => {
+    if (!selectedKey) return response
+    if (shouldCoolDownForStatus(response.status)) {
+      markProviderKeyFailure(config.id, selectedKey.id, response.status)
+    } else if (response.ok) {
+      markProviderKeySuccess(config.id, selectedKey.id)
+    }
+    return response
+  }
 
   try {
     if (apiFormat === 'anthropic') {
@@ -283,13 +322,14 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
       // endpoint (see providerRuntimeEnv). Only providers that explicitly opt out
       // of nested tool-result media (supportsNestedToolResultMedia=false) route
       // through the proxy so images/documents can be lifted out of tool_result
-      // before the request reaches an endpoint that would drop them.
+      // before the request reaches an endpoint that would drop them. Key pools
+      // and key-level proxy/headers also force the proxy path.
       //
       // That reasoning is about the provider's *own* format, so the guard only
       // applies without a per-model override: an OpenAI-format provider whose
       // model routes to anthropic still reaches the proxy, and its upstream is a
       // native Messages endpoint that accepts nested media unchanged.
-      if (modelApiFormat === undefined && config.supportsNestedToolResultMedia) {
+      if (modelApiFormat === undefined && config.supportsNestedToolResultMedia && !config.forceProxy) {
         return Response.json(
           {
             type: 'error',
@@ -308,15 +348,15 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
         resolvedApiFormat: apiFormat,
         supportsNestedToolResultMedia: config.supportsNestedToolResultMedia,
       })
-      return await handleAnthropicCompatible(body, upstreamBaseUrl, config.apiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext, upstreamHeaders, hoistNestedMedia)
+      return finalizeKeyResult(await handleAnthropicCompatible(body, upstreamBaseUrl, effectiveApiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext, upstreamHeaders, hoistNestedMedia))
     }
     if (apiFormat === 'gemini') {
-      return await handleGemini(body, upstreamBaseUrl, config.apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders)
+      return finalizeKeyResult(await handleGemini(body, upstreamBaseUrl, effectiveApiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders))
     }
     if (apiFormat === 'openai_chat') {
-      return await handleOpenaiChat(body, upstreamBaseUrl, config.apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders)
+      return finalizeKeyResult(await handleOpenaiChat(body, upstreamBaseUrl, effectiveApiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders))
     }
-    return await handleOpenaiResponses(body, upstreamBaseUrl, config.apiKey, isStream, networkSettings, traceContext, promptCacheKey, requestOptions, upstreamHeaders)
+    return finalizeKeyResult(await handleOpenaiResponses(body, upstreamBaseUrl, effectiveApiKey, isStream, networkSettings, traceContext, promptCacheKey, requestOptions, upstreamHeaders))
   } catch (err) {
     if (traceContext && !wasTraceErrorRecorded(err) && !recordedTraceErrorContexts.has(traceContext)) {
       void recordProxyTrace({

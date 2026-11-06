@@ -236,6 +236,7 @@ export async function providerTextCompletion(
     const usesLocalProxy = providerNeedsProxy(
       resolveProviderApiFormat(provider),
       provider.supportsNestedToolResultMedia,
+      provider,
     )
     const firstAttempt = {
       thinking: { type: 'disabled' },

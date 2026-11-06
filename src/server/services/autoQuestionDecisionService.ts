@@ -198,7 +198,7 @@ async function askSmallModel({
   }
   if (!provider.baseUrl) return null
 
-  if (providerNeedsProxy(resolveProviderApiFormat(provider), provider.supportsNestedToolResultMedia)) {
+  if (providerNeedsProxy(resolveProviderApiFormat(provider), provider.supportsNestedToolResultMedia, provider)) {
     return askThroughProxy(provider.id, sessionId, body, requestSignal)
   }
 

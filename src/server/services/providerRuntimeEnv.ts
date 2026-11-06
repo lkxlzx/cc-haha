@@ -23,7 +23,10 @@ import { PROVIDER_PRESETS } from '../config/providerPresets.js'
 import type {
   ApiFormat,
   ModelApiFormat,
+  ProviderApiKeyConfig,
   ProviderAuthStrategy,
+  ProviderKeyPool,
+  ProviderModelBinding,
   ProviderProxyConfig,
   ProvidersIndex,
   SavedProvider,
@@ -35,6 +38,9 @@ import {
   OPENAI_OFFICIAL_PROVIDER_ID,
   PROVIDER_DEEPSEEK_ACCOUNT_MODEL_IDS_SCHEMA_VERSION,
   PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,
+  ProviderApiKeyConfigSchema,
+  ProviderKeyPoolSchema,
+  ProviderModelBindingSchema,
 } from '../types/provider.js'
 import {
   ATTRIBUTION_HEADER_ENV_KEY,
@@ -268,11 +274,43 @@ export function normalizeProviderProxyConfig(value: unknown): ProviderProxyConfi
   return { mode: value.mode }
 }
 
+export function normalizeProviderApiKeyConfig(value: unknown): ProviderApiKeyConfig | undefined {
+  if (!isRecord(value)) return undefined
+  const parsed = ProviderApiKeyConfigSchema.safeParse({
+    ...value,
+    ...(value.proxy !== undefined && { proxy: normalizeProviderProxyConfig(value.proxy) }),
+  })
+  return parsed.success ? parsed.data : undefined
+}
+
+export function normalizeProviderKeyPool(value: unknown): ProviderKeyPool | undefined {
+  if (!isRecord(value)) return undefined
+  const rawKeys = Array.isArray(value.keys)
+    ? value.keys.map((key) => isRecord(key)
+      ? { ...key, ...(key.proxy !== undefined && { proxy: normalizeProviderProxyConfig(key.proxy) }) }
+      : key)
+    : []
+  const parsed = ProviderKeyPoolSchema.safeParse({ ...value, keys: rawKeys })
+  return parsed.success ? parsed.data : undefined
+}
+
+export function normalizeProviderModelBindings(value: unknown): ProviderModelBinding[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const bindings = value.flatMap((entry) => {
+    const parsed = ProviderModelBindingSchema.safeParse(entry)
+    return parsed.success ? [parsed.data] : []
+  })
+  return bindings.length > 0 ? bindings : undefined
+}
+
 export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
   const {
+    apiKeyConfig: rawApiKeyConfig,
     disableExperimentalBetas: rawDisableExperimentalBetas,
     imageGeneration: rawImageGeneration,
+    keyPool: rawKeyPool,
     model1mSupport: rawModel1mSupport,
+    modelBindings: rawModelBindings,
     proxy: rawProxy,
     supportsNestedToolResultMedia: rawSupportsNestedToolResultMedia,
     ...rest
@@ -281,12 +319,18 @@ export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
   const model1mSupport = normalizeModel1mSupport(rawModel1mSupport)
   const imageGeneration = normalizeImageGeneration(rawImageGeneration)
   const proxy = normalizeProviderProxyConfig(rawProxy)
+  const apiKeyConfig = normalizeProviderApiKeyConfig(rawApiKeyConfig)
+  const keyPool = normalizeProviderKeyPool(rawKeyPool)
+  const modelBindings = normalizeProviderModelBindings(rawModelBindings)
   return {
     ...rest,
     apiFormat: provider.apiFormat ?? 'anthropic',
     runtimeKind: provider.runtimeKind ?? 'anthropic_compatible',
     models: normalizeModelMapping(provider.models),
     ...(proxy !== undefined && { proxy }),
+    ...(apiKeyConfig !== undefined && { apiKeyConfig }),
+    ...(keyPool !== undefined && { keyPool }),
+    ...(modelBindings !== undefined && { modelBindings }),
     toolSearchEnabled: normalizeToolSearchEnabled(rawProvider.toolSearchEnabled),
     ...(typeof rawSupportsNestedToolResultMedia === 'boolean'
       ? { supportsNestedToolResultMedia: rawSupportsNestedToolResultMedia }
@@ -490,6 +534,7 @@ export function resolveProviderApiKey(
   provider: SavedProvider,
   presetDefaultEnv: Record<string, string>,
 ): string {
+  if (provider.apiKeyConfig?.enabled === false) return ''
   return provider.apiKey
     || presetDefaultEnv.ANTHROPIC_AUTH_TOKEN
     || presetDefaultEnv.ANTHROPIC_API_KEY
@@ -534,11 +579,30 @@ export function getManagedEnvKeys(): string[] {
   return [...keys]
 }
 
+/**
+ * Key-level routing needs the local proxy even for Anthropic-format providers:
+ * the CLI can only send one static auth header, while the proxy chooses a key
+ * per session and applies that key's proxy/headers.
+ */
+export function providerHasKeyRouting(
+  provider: Pick<SavedProvider, 'apiKeyConfig' | 'keyPool'>,
+): boolean {
+  const poolConfigured = (provider.keyPool?.keys.length ?? 0) > 0
+  const legacyHeaders = provider.apiKeyConfig?.headers
+  return poolConfigured
+    || provider.apiKeyConfig?.proxy !== undefined
+    || (legacyHeaders !== undefined && Object.keys(legacyHeaders).length > 0)
+    || provider.apiKeyConfig?.enabled === false
+}
+
 export function providerNeedsProxy(
   apiFormat: ApiFormat,
   supportsNestedToolResultMedia?: boolean,
+  provider?: Pick<SavedProvider, 'apiKeyConfig' | 'keyPool'>,
 ): boolean {
-  return apiFormat !== 'anthropic' || supportsNestedToolResultMedia === false
+  return apiFormat !== 'anthropic'
+    || supportsNestedToolResultMedia === false
+    || (provider !== undefined && providerHasKeyRouting(provider))
 }
 
 export function buildProviderManagedEnv(
@@ -568,7 +632,7 @@ export function buildProviderManagedEnv(
   // so images/documents are lifted out of tool_result before forwarding. A
   // preset with per-model rules resolves to an OpenAI format here, which also
   // forces the proxy — the only place those rules are applied.
-  const needsProxy = providerNeedsProxy(apiFormat, provider.supportsNestedToolResultMedia)
+  const needsProxy = providerNeedsProxy(apiFormat, provider.supportsNestedToolResultMedia, provider)
   const proxyPath = options?.proxyPath ?? '/proxy'
   const serverPort = options?.serverPort ?? 3456
   const baseUrl = needsProxy
@@ -684,6 +748,7 @@ export function readSavedProviderRuntime(
       needsProxy: providerNeedsProxy(
         resolveProviderApiFormat(provider),
         provider.supportsNestedToolResultMedia,
+        provider,
       ),
     }
   } catch {
@@ -713,6 +778,7 @@ export function activeProviderNeedsProxy(configDir: string): boolean {
     return providerNeedsProxy(
       resolveProviderApiFormat(provider),
       provider.supportsNestedToolResultMedia,
+      provider,
     )
   } catch {
     return false

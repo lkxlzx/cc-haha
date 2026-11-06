@@ -67,12 +67,17 @@ import {
   normalizeImageGeneration,
   normalizeModelMapping,
   normalizeProvidersIndex,
+  providerHasKeyRouting,
   providerNeedsProxy,
   resolveProviderApiFormat,
   resolveProviderApiKey,
 } from './providerRuntimeEnv.js'
 import { resolveModelApiBaseUrl, resolveModelApiRule, type ModelApiFormatRule } from '../../shared/modelApiFormats.js'
 import { applyUpstreamHeaders, resolveUpstreamHeaders } from '../proxy/upstreamHeaders.js'
+import {
+  resolveProviderKeyPool,
+  type ResolvedProviderKeyPool,
+} from './providerKeyPool.js'
 import {
   getNetworkProxyFetchOptions,
   loadNetworkSettings,
@@ -179,6 +184,9 @@ function buildSavedProvider(input: CreateProviderInput): SavedProvider {
     ...(input.requestCompatibility !== undefined && { requestCompatibility: input.requestCompatibility }),
     ...(imageGeneration !== undefined && { imageGeneration }),
     ...(input.proxy !== undefined && { proxy: input.proxy }),
+    ...(input.apiKeyConfig !== undefined && { apiKeyConfig: input.apiKeyConfig }),
+    ...(input.keyPool !== undefined && { keyPool: input.keyPool }),
+    ...(input.modelBindings !== undefined && { modelBindings: input.modelBindings }),
     ...(input.notes !== undefined && { notes: input.notes }),
   }
 }
@@ -431,10 +439,22 @@ export class ProviderService {
       ...(input.disableExperimentalBetas === true && { disableExperimentalBetas: true }),
       ...(imageGeneration !== undefined && imageGeneration !== null && { imageGeneration }),
       ...(input.proxy !== undefined && input.proxy !== null && { proxy: input.proxy }),
+      ...(input.apiKeyConfig !== undefined && input.apiKeyConfig !== null && { apiKeyConfig: input.apiKeyConfig }),
+      ...(input.keyPool !== undefined && input.keyPool !== null && { keyPool: input.keyPool }),
+      ...(input.modelBindings !== undefined && input.modelBindings !== null && { modelBindings: input.modelBindings }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
     if (input.proxy === null) {
       delete updated.proxy
+    }
+    if (input.apiKeyConfig === null) {
+      delete updated.apiKeyConfig
+    }
+    if (input.keyPool === null) {
+      delete updated.keyPool
+    }
+    if (input.modelBindings === null) {
+      delete updated.modelBindings
     }
     if (input.model1mSupport === null) {
       delete updated.model1mSupport
@@ -760,6 +780,7 @@ export class ProviderService {
       const needsProxy = providerNeedsProxy(
         provider.apiFormat ?? 'anthropic',
         provider.supportsNestedToolResultMedia,
+        provider,
       )
       const authEnv = buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy)
       if (Object.values(authEnv).some(value => value.length > 0)) {
@@ -811,6 +832,8 @@ export class ProviderService {
     authStrategy: ProviderAuthStrategy
     modelApiFormats: ModelApiFormatRule<ModelApiFormat>[]
     upstreamHeaders: Record<string, string>
+    keyPool: ResolvedProviderKeyPool
+    forceProxy: boolean
     requestCompatibility?: RequestCompatibility
     proxy?: ProviderProxyConfig
   } | null> {
@@ -826,6 +849,8 @@ export class ProviderService {
         authStrategy: provider.authStrategy ?? getPresetAuthStrategy(provider.presetId),
         modelApiFormats: getPresetModelApiFormats(provider.presetId),
         upstreamHeaders: getPresetUpstreamHeaders(provider.presetId),
+        keyPool: resolveProviderKeyPool(provider, resolveProviderApiKey(provider, presetDefaultEnv)),
+        forceProxy: providerHasKeyRouting(provider),
         ...(provider.requestCompatibility !== undefined && { requestCompatibility: provider.requestCompatibility }),
         ...(provider.proxy !== undefined && { proxy: provider.proxy }),
       }
