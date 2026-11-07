@@ -1,0 +1,254 @@
+name: Fork Auto Sync and Release
+
+on:
+  schedule:
+    # Daily at 19:00 UTC (03:00 China Standard Time)
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Build and publish even when upstream has no new commits'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-auto-sync-release
+  cancel-in-progress: false
+
+env:
+  BRANCH: feat/provider-key-pool-model-catalog
+  UPSTREAM_REPO: NanmiCoder/cc-haha
+  UPSTREAM_BRANCH: main
+  SIDECAR_TARGET_TRIPLE: x86_64-pc-windows-msvc
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+jobs:
+  sync:
+    name: Sync upstream
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      version: ${{ steps.sync.outputs.version }}
+      should_release: ${{ steps.sync.outputs.should_release }}
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Merge upstream main
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          changed=false
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo 'Already up to date with upstream.'
+          else
+            UPSTREAM_SHA=$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")
+            if ! git merge --no-ff "upstream/${UPSTREAM_BRANCH}" -m "chore: sync upstream ${UPSTREAM_SHA}"; then
+              git merge --abort || true
+              echo '::error::Upstream merge has conflicts; resolve them on the fork branch.'
+              exit 1
+            fi
+            git push origin "HEAD:${BRANCH}"
+            changed=true
+          fi
+
+          version=$(node -p "require('./desktop/package.json').version")
+          tag="fork-v${version}"
+          release_missing=false
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_missing=true
+          fi
+          force="${{ github.event_name == 'workflow_dispatch' && inputs.force_release || false }}"
+          should_release=false
+          if [ "$changed" = 'true' ] || [ "$release_missing" = 'true' ] || [ "$force" = 'true' ]; then
+            should_release=true
+          fi
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          echo "Version: $version | changed: $changed | release missing: $release_missing | should release: $should_release"
+
+  build-windows:
+    name: Build Windows installer
+    needs: sync
+    if: needs.sync.outputs.should_release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install root dependencies
+        run: bun install
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: bun install --cpu="*"
+
+      - name: Install adapter dependencies
+        working-directory: adapters
+        run: bun install
+
+      - name: Install mobile dependencies
+        working-directory: mobile
+        run: bun install --frozen-lockfile
+
+      - name: Prepare bundled ripgrep
+        working-directory: desktop
+        run: bun run prepare:ripgrep
+
+      - name: Prepare bundled Cloudflare connector
+        working-directory: desktop
+        run: bun run prepare:cloudflared
+
+      - name: Fetch native Computer Use dependencies
+        run: cargo +stable fetch --locked --manifest-path native/agent-desktop/Cargo.toml --target ${{ env.SIDECAR_TARGET_TRIPLE }}
+
+      - name: Build sidecars and native Computer Use
+        working-directory: desktop
+        env:
+          BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
+        run: bun run build:sidecars
+
+      - name: Verify compiled sidecar startup
+        working-directory: desktop
+        env:
+          CC_HAHA_COMPILED_SIDECAR_SMOKE_STARTS: '20'
+        run: bun run test:compiled-sidecar-smoke
+
+      - name: Build renderer and Electron bundles
+        working-directory: desktop
+        run: |
+          bun run build
+          bun run build:electron
+
+      - name: Build NSIS installer
+        working-directory: desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node ./node_modules/electron-builder/out/cli/cli.js --win nsis --x64 --publish never
+
+      - name: Verify package structure
+        run: bun run test:package-smoke --platform windows --arch x64 --package-kind release --artifacts-dir desktop/build-artifacts/electron
+
+      - name: Verify installer execution
+        timeout-minutes: 10
+        working-directory: desktop
+        run: powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File ./scripts/windows-installer-smoke.ps1 -ArtifactsDir ./build-artifacts/electron -Arch x64
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-windows-release-${{ needs.sync.outputs.version }}
+          path: |
+            desktop/build-artifacts/electron/Claude-Code-Haha-${{ needs.sync.outputs.version }}-Windows-x64-Setup.exe
+            desktop/build-artifacts/electron/Claude-Code-Haha-${{ needs.sync.outputs.version }}-Windows-x64-Setup.exe.blockmap
+            desktop/build-artifacts/electron/latest.yml
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - sync
+      - build-windows
+    if: needs.sync.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: fork-windows-release-${{ needs.sync.outputs.version }}
+          path: release-assets
+
+      - name: Prepare release body
+        id: body
+        shell: bash
+        run: |
+          notes="release-notes/v${{ needs.sync.outputs.version }}.md"
+          body="${RUNNER_TEMP}/release-body.md"
+          if [ -f "$notes" ]; then
+            cp "$notes" "$body"
+          else
+            printf 'Automated fork build of upstream v%s.\n' "${{ needs.sync.outputs.version }}" > "$body"
+          fi
+          echo "path=$body" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fork-v${{ needs.sync.outputs.version }}
+          target_commitish: ${{ env.BRANCH }}
+          name: Claude Code Haha v${{ needs.sync.outputs.version }} (Fork)
+          body_path: ${{ steps.body.outputs.path }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/Claude-Code-Haha-${{ needs.sync.outputs.version }}-Windows-x64-Setup.exe
+            release-assets/Claude-Code-Haha-${{ needs.sync.outputs.version }}-Windows-x64-Setup.exe.blockmap
+            release-assets/latest.yml
+
+  report-failure:
+    name: Report failure
+    needs:
+      - sync
+      - build-windows
+      - release
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Fork auto sync/release failed: $(date -u +%Y-%m-%d)" \
+            --body "Workflow run failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
