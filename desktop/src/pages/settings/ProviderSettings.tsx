@@ -49,7 +49,7 @@ import { SettingsPageHeader, SettingsPill } from '@/components/settings/Settings
 import { Dropdown } from '@/components/ui/Dropdown'
 import { SegmentedControl } from '@/components/ui/SegmentedControl'
 import { Tooltip } from '@/components/ui/Tooltip'
-import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ModelApiFormat, ProviderAuthStrategy, ProviderModelInfo, ProviderModelsErrorCode, ProviderProxyMode, ProviderKeyPool, ProviderApiKeyEntry, ProviderApiKeyConfig, ProviderModelBinding } from '../../types/provider'
+import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ModelApiFormat, ProviderAuthStrategy, ProviderModelInfo, ProviderModelsErrorCode, ProviderKeyPool, ProviderApiKeyEntry, ProviderApiKeyConfig, ProviderModelBinding } from '../../types/provider'
 import { normalizeKeyPoolDraft, toStoredKeyPool } from '../../lib/providerKeyPool'
 import { ProviderKeyPoolSection } from './ProviderKeyPoolSection'
 import { ProviderModelSlotsSection } from './ProviderModelSlotsSection'
@@ -59,7 +59,6 @@ import { resolveModelApiFormat } from '../../../../src/shared/modelApiFormats'
 import { apply1mSupportToContextInput, apply1mSupportToContextInputs, getAutoCompactWindowErrorKey, getModelContextWindowErrorKey, MODEL_SLOTS, parseAutoCompactWindowInput, parseModelContextWindowsInput, type ModelContextInputs, type ModelSlot } from '../../lib/providerModelContext'
 import type { ProviderPreset } from '../../types/providerPreset'
 import { normalizeProviderBaseUrl, presetMatchesBaseUrl, selectableProviderPresets } from '../../config/providerPresets'
-import { isValidHttpProxyUrl } from './shared'
 import {
   highlightSegments,
   initialProviderTab,
@@ -1435,7 +1434,6 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   const addToast = useUIStore((s) => s.addToast)
   const t = useTranslation()
   const baseUrlInputId = useId()
-  const proxyUrlInputId = useId()
 
   const fallbackPreset = buildFallbackPreset(provider)
   const loadedPresets = presets.filter((p) => p.id !== 'official')
@@ -1491,12 +1489,6 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   const [keyPool, setKeyPool] = useState<ProviderKeyPool>(() => normalizeKeyPoolDraft(provider?.keyPool))
   const hasPoolCredentials = keyPool.keys.some((key) => key.enabled !== false && key.apiKey.trim())
   const hasLegacyCredentials = apiKeyConfig.enabled !== false && Boolean(apiKey.trim())
-  const [proxyMode, setProxyMode] = useState<ProviderProxyMode>(provider?.proxy?.mode ?? 'follow_global')
-  const [proxyUrl, setProxyUrl] = useState(provider?.proxy?.url ?? '')
-  // The phone receives only the saved mode: proxy URLs can contain credentials.
-  const keepRemoteProxy = browserMode && mode === 'edit' &&
-    proxyMode === (provider?.proxy?.mode ?? 'follow_global') && proxyUrl === (provider?.proxy?.url ?? '')
-  const proxyUrlInvalid = proxyMode === 'manual' && proxyUrl.trim() !== '' && !isValidHttpProxyUrl(proxyUrl.trim())
   const [notes, setNotes] = useState(provider?.notes ?? '')
   const [compatibility, setCompatibility] = useState(() => compatibilityForm(provider?.requestCompatibility))
   const [models, setModels] = useState<ModelMapping>(initialModels)
@@ -1687,7 +1679,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   const modelContextWindowErrorSlots = MODEL_SLOTS.filter((slot) => getModelContextWindowErrorKey(modelContextInputs[slot]))
   const compatibilityInvalid = invalidCompatibilityNumber(compatibility.maxOutputTokens)
     || (apiFormat !== 'anthropic' && invalidCompatibilityNumber(compatibility.outputTokenLimit))
-  const canSubmit = !compatibilityInvalid && !(!keepRemoteProxy && proxyMode === 'manual' && !isValidHttpProxyUrl(proxyUrl.trim())) && name.trim() && baseUrl.trim() && (mode === 'edit' || !requiresApiKey || hasLegacyCredentials || hasPoolCredentials) && models.main.trim() && (!imageGeneration.enabled || imageGeneration.model.trim()) && !settingsJsonError && !autoCompactWindowErrorKey && modelContextWindowErrorSlots.length === 0
+  const canSubmit = !compatibilityInvalid && name.trim() && baseUrl.trim() && (mode === 'edit' || !requiresApiKey || hasLegacyCredentials || hasPoolCredentials) && models.main.trim() && (!imageGeneration.enabled || imageGeneration.model.trim()) && !settingsJsonError && !autoCompactWindowErrorKey && modelContextWindowErrorSlots.length === 0
   const normalizedBaseUrl = normalizeProviderBaseUrl(baseUrl)
   const isPresetDefaultEndpoint = normalizedBaseUrl === normalizeProviderBaseUrl(selectedPreset.baseUrl)
   const apiKeyUrl = isPresetDefaultEndpoint ? selectedPreset.apiKeyUrl?.trim() : undefined
@@ -1958,12 +1950,8 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
     try {
       // Upstream failures arrive as a resolved `ok: false`, so the catch below
       // only covers our own server being unreachable.
-      // Probe through the proxy this provider will actually use for chat.
-      const probeProxy = proxyMode === 'direct'
-        ? { mode: proxyMode }
-        : proxyMode === 'manual' && isValidHttpProxyUrl(proxyUrl.trim())
-          ? { mode: proxyMode, url: proxyUrl.trim() }
-          : undefined
+      // Probe through the same per-key proxy the primary key uses for chat.
+      const probeProxy = apiKeyConfig.proxy?.mode === 'follow_global' ? undefined : apiKeyConfig.proxy
       const result = await fetchModels({ baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), ...(probeProxy && { proxy: probeProxy }) })
       // The form moved on while we were probing — this answer describes a base
       // URL or key the user no longer has typed in.
@@ -2110,11 +2098,6 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
           ...(imageGeneration.apiKey.trim() ? { apiKey: imageGeneration.apiKey.trim() } : {}),
         }
       : undefined
-    const storedProxy = proxyMode === 'manual'
-      ? { mode: proxyMode, url: proxyUrl.trim() }
-      : proxyMode === 'follow_global'
-        ? null
-        : { mode: proxyMode }
     setIsSubmitting(true)
     setSaveFailed(false)
     setCredentialRequired(false)
@@ -2155,7 +2138,6 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
           ...(disableExperimentalBetas && { disableExperimentalBetas }),
           supportsNestedToolResultMedia,
           ...(storedImageGeneration !== undefined && { imageGeneration: storedImageGeneration }),
-          ...(storedProxy && { proxy: storedProxy }),
           ...(storedKeyPool && { keyPool: storedKeyPool }),
           ...(storedApiKeyConfig && { apiKeyConfig: storedApiKeyConfig }),
           ...(storedModelBindings.length > 0 && { modelBindings: storedModelBindings }),
@@ -2178,7 +2160,6 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
           disableExperimentalBetas,
           supportsNestedToolResultMedia,
           imageGeneration: storedImageGeneration ?? null,
-          ...(!keepRemoteProxy && { proxy: storedProxy }),
           keyPool: storedKeyPool ?? null,
           apiKeyConfig: storedApiKeyConfig ?? null,
           modelBindings: storedModelBindings.length > 0 ? storedModelBindings : null,
@@ -2211,18 +2192,13 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
     setTestResult(null)
     try {
       let result: ProviderTestResult
-      const proxyFormValue = proxyMode === 'manual'
-        ? { mode: proxyMode, url: proxyUrl.trim() }
-        : proxyMode === 'follow_global'
-          ? null
-          : { mode: proxyMode }
+      const probeProxy = apiKeyConfig.proxy?.mode === 'follow_global' ? undefined : apiKeyConfig.proxy
       const savedConfigUnchanged = mode === 'edit' && provider && !apiKey.trim() &&
         baseUrl.trim() === provider.baseUrl.trim() &&
         apiFormat === provider.apiFormat &&
         authStrategy === provider.authStrategy &&
         supportsNestedToolResultMedia === (provider.supportsNestedToolResultMedia ?? true) &&
-        JSON.stringify(formCompatibility) === JSON.stringify(provider.requestCompatibility) &&
-        JSON.stringify(proxyFormValue ?? null) === JSON.stringify(provider.proxy ?? null)
+        JSON.stringify(formCompatibility) === JSON.stringify(provider.requestCompatibility)
       if (savedConfigUnchanged && provider) {
         result = await useProviderStore.getState().testProvider(provider.id, {
           modelId: models.main.trim(),
@@ -2237,7 +2213,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
           apiFormat,
           supportsNestedToolResultMedia,
           presetId: selectedPreset.id,
-          ...(proxyFormValue ? { proxy: proxyFormValue } : {}),
+          ...(probeProxy ? { proxy: probeProxy } : {}),
           ...(formCompatibility ? { requestCompatibility: formCompatibility } : {}),
         })
       }
@@ -2737,51 +2713,6 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
           value={imageGeneration}
           onChange={setImageGeneration}
         />
-
-        <div className="flex flex-col gap-2 border-t border-[var(--color-border)] pt-4">
-          <div className="flex items-center gap-1">
-            <span className={FORM_FIELD_LABEL}>{t('settings.providers.proxyMode')}</span>
-            <Tooltip content={t('settings.providers.proxyModeTooltip')} placement="bottom-start">
-              <IconButton
-                icon={<Info size={12} strokeWidth={2} aria-hidden="true" />}
-                label={t('settings.providers.proxyModeHelp')}
-                showTooltip={false}
-                size="2xs"
-                tone="muted"
-                shape="circle"
-              />
-            </Tooltip>
-          </div>
-          <SegmentedControl<ProviderProxyMode>
-            label={t('settings.providers.proxyMode')}
-            layout="fill"
-            size="sm"
-            value={proxyMode}
-            onChange={setProxyMode}
-            items={[
-              { value: 'follow_global', label: t('settings.providers.proxyModeFollowGlobal') },
-              { value: 'direct', label: t('settings.providers.proxyModeDirect') },
-              { value: 'manual', label: t('settings.providers.proxyModeManual') },
-            ]}
-          />
-          <p className="text-xs leading-[1.5] text-[var(--color-text-tertiary)]">{t('settings.providers.proxyModeHint')}</p>
-          {proxyMode === 'manual' && (
-            <div className="flex flex-col gap-1">
-              <label htmlFor={proxyUrlInputId} className={FORM_FIELD_LABEL}>{t('settings.providers.proxyUrl')}</label>
-              <Input
-                id={proxyUrlInputId}
-                required={!keepRemoteProxy}
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                placeholder={t(keepRemoteProxy ? 'settings.providers.proxyUrlSaved' : 'settings.providers.proxyUrlPlaceholder')}
-                className="font-mono text-[13px]"
-              />
-              {proxyUrlInvalid && (
-                <p role="alert" className="text-xs leading-[1.5] text-[var(--color-error)]">{t('settings.providers.proxyUrlInvalid')}</p>
-              )}
-            </div>
-          )}
-        </div>
       </div>
       </Modal>
       <ConfirmDialog

@@ -222,7 +222,7 @@ describe('active sponsor providers', () => {
     })))
   })
 
-  it('fetches models through the proxy mode chosen in the form, not the global one', async () => {
+  it('fetches models through the primary key proxy', async () => {
     const fetchModels = vi.spyOn(providersApi, 'fetchModels').mockResolvedValue({
       ok: true,
       endpoint: 'https://modelflare.dev/v1/models',
@@ -233,10 +233,10 @@ describe('active sponsor providers', () => {
     const dialog = within(screen.getByRole('dialog'))
     fireEvent.click(dialog.getByRole('button', { name: 'Modelflare' }))
     fireEvent.change(dialog.getAllByPlaceholderText('sk-...')[0]!, { target: { value: 'fake-modelflare-key' } })
-    fireEvent.click(dialog.getByRole('radio', { name: 'Direct' }))
+    fireEvent.change(dialog.getByRole('textbox', { name: 'Single key proxy' }), { target: { value: 'http://127.0.0.1:7890' } })
     fireEvent.click(dialog.getByRole('button', { name: 'Fetch models' }))
     await waitFor(() => expect(fetchModels).toHaveBeenCalledWith({
-      baseUrl: 'https://modelflare.dev', apiKey: 'fake-modelflare-key', proxy: { mode: 'direct' },
+      baseUrl: 'https://modelflare.dev', apiKey: 'fake-modelflare-key', proxy: { mode: 'manual', url: 'http://127.0.0.1:7890' },
     }))
   })
 
