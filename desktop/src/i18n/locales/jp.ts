@@ -1,6 +1,22 @@
 import type { TranslationKey } from './en'
 
 export const jp: Record<TranslationKey, string> = {
+  'settings.adapters.wechatHealthStopped': "メッセージ接続は停止中",
+  'settings.adapters.wechatHealthStarting': "メッセージ接続中",
+  'settings.adapters.wechatHealthOnline': "メッセージ接続はオンライン",
+  'settings.adapters.wechatHealthReconnecting': "メッセージ接続を再接続中",
+  'settings.adapters.wechatHealthAuthExpired': "ログイン期限切れ — 再スキャンしてください",
+  'settings.adapters.wechatHealthError': "メッセージ接続エラー",
+  'settings.adapters.wechatHealthStale': "接続状態の有効期限切れ",
+  'settings.adapters.wechatHealthServerOffline': "ローカルサービスに接続できません",
+  'settings.adapters.wechatHealthChecking': "接続を確認中",
+  'settings.adapters.wechatHealthReconnect': "再接続",
+  'settings.adapters.wechatHealthPaired': "承認済みユーザーがいます",
+  'settings.adapters.wechatHealthUnpaired': "ユーザーのペアリング待ち",
+  'settings.adapters.wechatHealthLastReceive': "最終受信",
+  'settings.adapters.wechatHealthLastSend': "最終送信",
+  'settings.adapters.wechatHealthNever': "まだありません",
+  'settings.adapters.wechatHealthRestartFailed': "再接続に失敗しました。デスクトップサービスの動作を確認して再試行してください。",
   "sidebar.archiveSession": "アーカイブ",
   "sidebar.restoreSession": "復元",
   "sidebar.archivedSessions": "アーカイブ済みセッション",
@@ -1705,6 +1721,12 @@ export const jp: Record<TranslationKey, string> = {
   'settings.providers.officialModelsRefresh': 'モデル一覧を更新',
   'settings.providers.officialModelsRefreshed': 'モデル一覧を更新しました（{count} 件）。モデルを選択し、マッピングを保存すると使用できます。',
   'settings.providers.officialModelsRefreshError': 'モデル一覧を更新できませんでした。以前の一覧は引き続き使用できます。再試行するか、モデル ID を手入力してください。',
+  'settings.providers.officialContextTitle': 'コンテキストウィンドウ（任意）',
+  'settings.providers.officialContextDesc': '空欄の場合は公式のデフォルト値を使用します。入力した値はそのモデルのコンテキストウィンドウを置き換え、自動圧縮もこの値に従います。新しいセッションから有効になります。',
+  'settings.providers.officialContextHintBoth': 'デフォルト {default}、上限 {max}',
+  'settings.providers.officialContextHintDefault': 'デフォルト {default}',
+  'settings.providers.officialContextHintMax': '上限 {max}',
+  'settings.providers.officialContextOverMax': 'このモデルの上限 {max} を超えることはできません。',
   'settings.providers.grokOfficialName': 'Grok 公式',
   'settings.providers.grokOfficialDesc': 'xAI アカウントによる公式 Grok OAuth — API キー不要',
   'settings.providers.deepseekAccountName': 'DeepSeek アカウント',
@@ -4264,6 +4286,7 @@ export const jp: Record<TranslationKey, string> = {
   'app.launching': 'ローカルワークスペースを起動中...',
 
   // ─── Error Codes ──────────────────────────────────────
+  'error.billing_error': 'プロバイダーの利用枠または残高が不足しています。請求情報を確認し、利用枠の回復を待つか、別のプロバイダーに切り替えてください。',
   'error.CLI_NOT_RUNNING': 'CLI プロセスが実行されていません。セッションが終了したか、プロセスがクラッシュした可能性があります。',
   'error.CLI_START_FAILED': 'CLI プロセスの起動に失敗しました。',
   'error.CLI_AUTH_REQUIRED': '認証が必要です。ログインしてください。',

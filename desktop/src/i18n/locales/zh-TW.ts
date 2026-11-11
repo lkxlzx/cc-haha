@@ -1,6 +1,22 @@
 import type { TranslationKey } from './en'
 
 export const zh: Record<TranslationKey, string> = {
+  'settings.adapters.wechatHealthStopped': "訊息通道已停止",
+  'settings.adapters.wechatHealthStarting': "正在連接訊息通道",
+  'settings.adapters.wechatHealthOnline': "訊息通道在線",
+  'settings.adapters.wechatHealthReconnecting': "訊息通道正在重連",
+  'settings.adapters.wechatHealthAuthExpired': "登入已失效，請重新掃碼",
+  'settings.adapters.wechatHealthError': "訊息通道異常",
+  'settings.adapters.wechatHealthStale': "連線狀態已過期",
+  'settings.adapters.wechatHealthServerOffline': "無法連接本機服務",
+  'settings.adapters.wechatHealthChecking': "正在檢查連線",
+  'settings.adapters.wechatHealthReconnect': "重新連接",
+  'settings.adapters.wechatHealthPaired': "已有使用者獲准使用",
+  'settings.adapters.wechatHealthUnpaired': "等待使用者配對",
+  'settings.adapters.wechatHealthLastReceive': "最近接收",
+  'settings.adapters.wechatHealthLastSend': "最近傳送",
+  'settings.adapters.wechatHealthNever': "尚無",
+  'settings.adapters.wechatHealthRestartFailed': "重新連接失敗，請確認桌面服務正在執行後重試。",
   "sidebar.archiveSession": "封存",
   "sidebar.restoreSession": "還原",
   "sidebar.archivedSessions": "已封存對話",
@@ -1704,6 +1720,12 @@ export const zh: Record<TranslationKey, string> = {
   'settings.providers.officialModelsRefresh': '更新模型清單',
   'settings.providers.officialModelsRefreshed': '模型清單已更新（{count} 個），選擇模型並儲存對應後即可使用。',
   'settings.providers.officialModelsRefreshError': '更新模型清單失敗，已保留原有清單。請重試，或手動填寫模型 ID。',
+  'settings.providers.officialContextTitle': '上下文視窗（選填）',
+  'settings.providers.officialContextDesc': '留空則使用官方預設值。填寫後會覆蓋該模型的上下文視窗，自動壓縮依此觸發，對新建的會話生效。',
+  'settings.providers.officialContextHintBoth': '預設 {default}，上限 {max}',
+  'settings.providers.officialContextHintDefault': '預設 {default}',
+  'settings.providers.officialContextHintMax': '上限 {max}',
+  'settings.providers.officialContextOverMax': '不能超過該模型的上限 {max}。',
   'settings.providers.grokOfficialName': 'Grok 官方',
   'settings.providers.grokOfficialDesc': '透過 xAI 賬號完成 Grok 官方 OAuth — 無需 API 金鑰',
   'settings.providers.deepseekAccountName': 'DeepSeek 帳號',
@@ -4263,6 +4285,7 @@ export const zh: Record<TranslationKey, string> = {
   'app.launching': '正在啟動本地工作區...',
 
   // ─── Error Codes ──────────────────────────────────────
+  'error.billing_error': '供應商額度或餘額不足。請檢查供應商的計費資訊、等待額度恢復，或切換至其他供應商。',
   'error.CLI_NOT_RUNNING': 'CLI 程序未執行。會話可能已結束或程序已崩潰。',
   'error.CLI_START_FAILED': 'CLI 程序啟動失敗。',
   'error.CLI_AUTH_REQUIRED': '需要認證。請先登入。',

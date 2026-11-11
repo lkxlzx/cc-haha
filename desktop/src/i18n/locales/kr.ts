@@ -1,6 +1,22 @@
 import type { TranslationKey } from './en'
 
 export const kr: Record<TranslationKey, string> = {
+  'settings.adapters.wechatHealthStopped': "메시지 연결 중지됨",
+  'settings.adapters.wechatHealthStarting': "메시지 연결 중",
+  'settings.adapters.wechatHealthOnline': "메시지 연결 온라인",
+  'settings.adapters.wechatHealthReconnecting': "메시지 다시 연결 중",
+  'settings.adapters.wechatHealthAuthExpired': "로그인 만료 — 다시 스캔하세요",
+  'settings.adapters.wechatHealthError': "메시지 연결 오류",
+  'settings.adapters.wechatHealthStale': "연결 상태 만료됨",
+  'settings.adapters.wechatHealthServerOffline': "로컬 서비스에 연결할 수 없음",
+  'settings.adapters.wechatHealthChecking': "연결 확인 중",
+  'settings.adapters.wechatHealthReconnect': "다시 연결",
+  'settings.adapters.wechatHealthPaired': "승인된 사용자가 있습니다",
+  'settings.adapters.wechatHealthUnpaired': "사용자 페어링 대기 중",
+  'settings.adapters.wechatHealthLastReceive': "최근 수신",
+  'settings.adapters.wechatHealthLastSend': "최근 발신",
+  'settings.adapters.wechatHealthNever': "아직 없음",
+  'settings.adapters.wechatHealthRestartFailed': "다시 연결하지 못했습니다. 데스크톱 서비스가 실행 중인지 확인하고 다시 시도하세요.",
   "sidebar.archiveSession": "보관",
   "sidebar.restoreSession": "복원",
   "sidebar.archivedSessions": "보관된 세션",
@@ -1707,6 +1723,12 @@ export const kr: Record<TranslationKey, string> = {
   'settings.providers.officialModelsRefresh': '모델 목록 새로고침',
   'settings.providers.officialModelsRefreshed': '모델 목록을 업데이트했습니다({count}개). 모델을 선택하고 매핑을 저장하면 사용할 수 있습니다.',
   'settings.providers.officialModelsRefreshError': '모델 목록을 업데이트하지 못했습니다. 이전 목록은 계속 사용할 수 있습니다. 다시 시도하거나 모델 ID를 직접 입력하세요.',
+  'settings.providers.officialContextTitle': '컨텍스트 창(선택 사항)',
+  'settings.providers.officialContextDesc': '비워 두면 공식 기본값을 사용합니다. 값을 입력하면 해당 모델의 컨텍스트 창을 대체하며 자동 압축도 이 값을 따릅니다. 새 세션부터 적용됩니다.',
+  'settings.providers.officialContextHintBoth': '기본값 {default}, 최대 {max}',
+  'settings.providers.officialContextHintDefault': '기본값 {default}',
+  'settings.providers.officialContextHintMax': '최대 {max}',
+  'settings.providers.officialContextOverMax': '이 모델의 한도 {max}을(를) 초과할 수 없습니다.',
   'settings.providers.grokOfficialName': 'Grok 공식',
   'settings.providers.grokOfficialDesc': 'xAI 계정을 통한 공식 Grok OAuth — API 키 불필요',
   'settings.providers.deepseekAccountName': 'DeepSeek 계정',
@@ -4266,6 +4288,7 @@ export const kr: Record<TranslationKey, string> = {
   'app.launching': '로컬 작업 공간을 시작하는 중...',
 
   // ─── Error Codes ──────────────────────────────────────
+  'error.billing_error': '공급자의 사용 한도 또는 잔액이 소진되었습니다. 결제 정보를 확인하거나 한도가 갱신될 때까지 기다리거나 다른 공급자로 전환하세요.',
   'error.CLI_NOT_RUNNING': 'CLI 프로세스가 실행되고 있지 않습니다. 세션이 종료되었거나 프로세스가 충돌했을 수 있습니다.',
   'error.CLI_START_FAILED': 'CLI 프로세스를 시작하지 못했습니다.',
   'error.CLI_AUTH_REQUIRED': '인증이 필요합니다. 로그인하세요.',

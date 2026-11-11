@@ -30,6 +30,7 @@ import { PROVIDER_PRESETS } from '../config/providerPresets.js'
 import {
   CreateProviderSchema,
   DEEPSEEK_ACCOUNT_PROVIDER_ID,
+  ModelContextWindowsSchema,
   ModelMappingSchema,
   ProviderProxyConfigSchema,
   UpdateProviderSchema,
@@ -72,6 +73,8 @@ const OfficialProviderModelsUpdateSchema = z.object({
   models: ModelMappingSchema.extend({
     main: z.string().trim().min(1),
   }),
+  // Omitted keeps the saved overrides; `{}` clears them.
+  modelContextWindows: ModelContextWindowsSchema.optional(),
 })
 
 export async function handleProvidersApi(
@@ -195,15 +198,21 @@ export async function handleProvidersApi(
     if (action === 'models') {
       if (req.method === 'GET') {
         const models = await providerService.getOfficialProviderModels(id)
-        return Response.json({ models })
+        const modelContextWindows = await providerService.getOfficialProviderContextWindows(id)
+        return Response.json({ models, modelContextWindows })
       }
       if (req.method === 'PUT') {
         const parsed = OfficialProviderModelsUpdateSchema.safeParse(await parseJsonBody(req))
         if (!parsed.success) {
           throw ApiError.badRequest(parsed.error.issues.map((issue) => issue.message).join('; '))
         }
-        const models = await providerService.updateOfficialProviderModels(id, parsed.data.models)
-        return Response.json({ models })
+        const models = await providerService.updateOfficialProviderModels(
+          id,
+          parsed.data.models,
+          { modelContextWindows: parsed.data.modelContextWindows },
+        )
+        const modelContextWindows = await providerService.getOfficialProviderContextWindows(id)
+        return Response.json({ models, modelContextWindows })
       }
       throw methodNotAllowed(req.method)
     }
