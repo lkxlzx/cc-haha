@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import css from './globals.css?raw'
-import { THEME_MODES } from '../types/settings'
+import { DARK_THEME_MODES, THEME_MODES } from '../types/settings'
 import { THEME_BACKGROUNDS } from './systemAppearance'
 
 const normalizedCss = css.replace(/\r\n/g, '\n')
@@ -45,18 +45,14 @@ function getCssBetween(startMarker: string, endMarker: string) {
 }
 
 /**
- * The six 「纸 · 墨 · 印」 palettes. Each block holds only raw `--cc-*` color
+ * The supported palettes. Each block holds only raw `--cc-*` color
  * values; the shared `:root` semantic layer turns those into the `--color-*`
  * tokens components consume, so the mapping is written once instead of copied
  * per theme.
  */
 const themes = [
   ':root,\n[data-theme="white"]',
-  '[data-theme="paper"]',
-  '[data-theme="warm-classic"]',
-  '[data-theme="celadon"]',
   '[data-theme="dark"]',
-  '[data-theme="ink-blue"]',
 ] as const
 
 describe('desktop theme tokens', () => {
@@ -68,6 +64,7 @@ describe('desktop theme tokens', () => {
    */
   const requiredSourceTokens = [
     '--cc-bg', '--cc-s0', '--cc-s1', '--cc-s2', '--cc-bd', '--cc-bd2',
+    '--cc-bd-strong', '--cc-tab-edge', '--cc-tab-sep',
     '--cc-t1', '--cc-t2', '--cc-t3',
     '--cc-ac', '--cc-ac2', '--cc-ac-soft', '--cc-ac-soft-hover', '--cc-ac-border',
     '--cc-ac-ink', '--cc-on-ac',
@@ -169,13 +166,33 @@ describe('desktop theme tokens', () => {
     for (const theme of themes) {
       expect(getThemeBlock(theme), `${theme} should declare color-scheme`).toContain('color-scheme:')
     }
-    expect(getThemeBlock('[data-theme="ink-blue"]')).toContain('color-scheme: dark;')
+    for (const theme of DARK_THEME_MODES) {
+      expect(getThemeBlock(`[data-theme="${theme}"]`)).toContain('color-scheme: dark;')
+    }
   })
 
-  it('binds the dark utility variant to both ink themes', () => {
+  it('binds the dark utility variant to every dark theme', () => {
     // `dark:` utilities compile against this list. Omitting ink-blue makes
     // every one of them silently render its light branch on that theme.
-    expect(normalizedCss).toContain('[data-theme="ink-blue"], [data-theme="ink-blue"] *')
+    for (const theme of DARK_THEME_MODES) {
+      expect(normalizedCss).toContain(`[data-theme="${theme}"], [data-theme="${theme}"] *`)
+    }
+  })
+
+  it('removes muddy SVG surface grain and uses crisp geometric sans for --font-headline', () => {
+    expect(normalizedCss).toContain('--surface-grain: none;')
+    expect(normalizedCss).not.toContain('feTurbulence')
+    const themeBlock = getThemeBlock('@theme')
+    expect(themeBlock).toContain('--font-headline: "Plus Jakarta Sans", "Geist", -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;')
+    expect(themeBlock).not.toMatch(/--font-headline:[^;]*Noto Serif SC/)
+  })
+
+  it('uses dark terminal and syntax colors for every dark palette', () => {
+    const selector = DARK_THEME_MODES.map((theme) => `[data-theme="${theme}"]`).join(',\n')
+    const block = getThemeBlock(selector)
+    expect(block).toContain('--color-terminal-ansi-red: #FF6D67;')
+    expect(block).toContain('--color-code-comment: #8F8683;')
+    expect(block).toContain('--color-diff-syntax-string: #A8CE8C;')
   })
 
   it('keeps activity heatmap colors on the app theme accent instead of the old blue ramp', () => {
@@ -233,10 +250,10 @@ describe('desktop theme tokens', () => {
     expect(zoomShellCss).not.toContain('color-mix(')
   })
 
-  it('keeps the UI zoom slider thumb visible on both ink grounds', () => {
+  it('keeps the UI zoom slider thumb visible on every dark ground', () => {
     // The thumb is a light disc on a light track; on a dark ground it needs an
     // accent border to read at all. Both dark palettes get the override.
-    expect(css).toContain('[data-theme="dark"] .settings-zoom-control,\n[data-theme="ink-blue"] .settings-zoom-control')
+    expect(css).toContain(DARK_THEME_MODES.map((theme) => `[data-theme="${theme}"] .settings-zoom-control`).join(',\n'))
     expect(css).toContain('--settings-zoom-thumb-bg: var(--color-surface-bright);')
     expect(css).toContain('--settings-zoom-thumb-border: var(--color-brand);')
     expect(css).toContain('box-shadow: var(--settings-zoom-thumb-shadow);')
@@ -368,15 +385,11 @@ describe('desktop theme tokens', () => {
 })
 
 /**
- * `.glass-panel` states a translucent fill and a blur in one rule, and reads as
- * frosted only when both land. The blur is the fragile half: where
- * `backdrop-filter` does not run there is no failure for CSS to report — the
- * declaration is simply skipped, the fill stays translucent on its own, and
- * page text reads straight through the panel. That is what put a legible
- * provider list behind the 860px provider form.
- *
- * These pin the two defenses. Dialogs opted out of the coupling entirely;
- * the small floating layers kept it but no longer depend on it for legibility.
+ * Layered frosted glass surfaces pair translucent fills (`0.82–0.86` alpha) with
+ * `backdrop-filter` blur/saturation and a 1px top specular rim. Where
+ * `backdrop-filter` is unavailable, CSS silently drops the blur without
+ * reporting a failure — so every translucent surface MUST drop back to its
+ * opaque fill inside `@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)))`.
  */
 describe('overlay opacity contract', () => {
   /** Every value assigned to `token` across the stylesheet, in source order. */
@@ -393,11 +406,11 @@ describe('overlay opacity contract', () => {
     return Number(match![1])
   }
 
-  it('gives dialogs a fill with no alpha channel at all, in every theme', () => {
-    // Not "mostly opaque" — an rgba() here would put the regression back one
-    // decimal at a time.
+  it('gives the opaque dialog fallback token a fill with no alpha channel in every theme', () => {
+    // `--color-surface-dialog` is both the `@supports` fallback when blur is
+    // unavailable and the surface measured by contrast tests.
     for (const value of declarationsOf('--color-surface-dialog')) {
-      expect(value, `dialog fill should be opaque, got "${value}"`).not.toMatch(/rgba|hsla/)
+      expect(value, `dialog fallback fill should be opaque, got "${value}"`).not.toMatch(/rgba|hsla/)
       expect(value).not.toMatch(/,\s*[0-9.]+\s*\)\s*$/)
     }
   })
@@ -410,32 +423,37 @@ describe('overlay opacity contract', () => {
     expect(values).toContain('var(--cc-s1)')
   })
 
-  it('keeps the glass fill dense enough to stand without the blur', () => {
-    // At 0.84 the page was readable through unblurred glass. These floating
-    // layers are small enough that the frosted look survives the extra density.
-    for (const value of declarationsOf('--color-surface-glass')) {
-      expect(alphaOf(value), `glass fill "${value}" is too sheer`).toBeGreaterThanOrEqual(0.9)
+  it('keeps frosted glass fills dense enough (>= 0.80 alpha) for legible blur', () => {
+    for (const token of ['--color-surface-glass', '--color-surface-dialog-glass']) {
+      for (const value of declarationsOf(token)) {
+        expect(alphaOf(value), `${token} fill "${value}" is too sheer`).toBeGreaterThanOrEqual(0.8)
+      }
     }
   })
 
-  it('drops glass to a fully opaque fill where backdrop-filter is unavailable', () => {
-    const fallback = normalizedCss.match(
-      /@supports not \(\(backdrop-filter[^)]*\)[^{]*\{\s*\.glass-panel\s*\{([^}]*)\}/,
-    )
-    expect(fallback, 'expected an @supports fallback for .glass-panel').not.toBeNull()
-    expect(fallback![1]).toMatch(/background:\s*rgb\(var\(--cc-bg-rgb\)\)/)
-  })
-
-  it('keeps the dialog panel off backdrop-filter entirely', () => {
+  it('uses frosted dialog glass on .dialog-panel with top specular rim and ambient shadow', () => {
     const rule = normalizedCss.match(/\n\.dialog-panel \{([^}]*)\}/)
     expect(rule, 'expected a .dialog-panel rule').not.toBeNull()
-    expect(rule![1]).not.toMatch(/backdrop-filter/)
-    expect(rule![1]).toMatch(/background:\s*var\(--color-surface-dialog\)/)
+    expect(rule![1]).toMatch(/background:\s*var\(--color-surface-dialog-glass\)/)
+    expect(rule![1]).toMatch(/backdrop-filter:\s*blur\(var\(--glass-blur\)\)/)
+    expect(rule![1]).toMatch(/box-shadow:\s*var\(--glass-top-rim\),\s*var\(--shadow-dialog-glass\)/)
+  })
+
+  it('drops every frosted glass surface to an opaque fill where backdrop-filter is unavailable', () => {
+    const fallbackStart = normalizedCss.indexOf('@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {')
+    expect(fallbackStart, 'expected an @supports fallback block for frosted glass').toBeGreaterThanOrEqual(0)
+    const fallbackBlock = getThemeBlock('@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)))')
+    expect(fallbackBlock).toContain('.glass-panel')
+    expect(fallbackBlock).toContain('.surface-glass')
+    expect(fallbackBlock).toContain('.dropdown-glass')
+    expect(fallbackBlock).toMatch(/background:\s*rgb\(var\(--cc-bg-rgb\)\)/)
+    expect(fallbackBlock).toContain('.dialog-glass')
+    expect(fallbackBlock).toContain('.dialog-panel')
+    expect(fallbackBlock).toContain('.composer-glass')
+    expect(fallbackBlock).toMatch(/background:\s*var\(--color-surface-dialog\)/)
   })
 
   it('dims harder behind a modal than behind a non-modal drawer', () => {
-    // Now that the panel is opaque the scrim is the only thing separating the
-    // dialog from the page, so it carries more weight than the sidebar's.
     const modal = declarationsOf('--color-modal-scrim').map(alphaOf)
     const overlay = declarationsOf('--color-overlay-scrim').map(alphaOf)
     expect(modal).toHaveLength(overlay.length)
@@ -443,6 +461,56 @@ describe('overlay opacity contract', () => {
       expect(alpha, 'modal scrim should be at least as heavy as the overlay scrim')
         .toBeGreaterThanOrEqual(overlay[index]!)
     })
+  })
+})
+
+describe('Safari 15-safe texture utilities', () => {
+  it('defines surface grain, bevel, scroll fade, glass, seam, and stepped motion utilities without color-mix', () => {
+    expect(normalizedCss).not.toContain('color-mix(')
+    for (const token of [
+      '--surface-grain:',
+      '--bevel-surface-rest:',
+      '--bevel-surface-pressed:',
+      '--bevel-cta-rest:',
+      '--bevel-cta-pressed:',
+      '--app-scrollbar-width: 6px;',
+      '--ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);',
+    ]) {
+      expect(normalizedCss, `missing token ${token}`).toContain(token)
+    }
+    for (const selector of [
+      '.surface-grain {',
+      '.control-bevel {',
+      '.control-bevel-cta {',
+      '.surface-glass {',
+      '.dropdown-glass {',
+      '.dialog-glass {',
+      '.dialog-backdrop {',
+      '.composer-glass {',
+      '.composer-seam-below {',
+      '.composer-seam-above {',
+      '.topbar-scroll-fade {',
+      '.scroll-edge-fade {',
+      '.scrollbar-autohide {',
+      '.animate-stepped-pulse {',
+      '.animate-stepped-shimmer {',
+      '.popover-motion {',
+    ]) {
+      expect(normalizedCss, `missing utility ${selector}`).toContain(selector)
+    }
+  })
+
+  it('keeps .control-bevel and .control-bevel-cta inside @layer components so Tailwind absolute/fixed utilities win', () => {
+    const componentsLayer = normalizedCss.match(/@layer components \{[\s\S]*?\.control-bevel \{[\s\S]*?\.control-bevel-cta \{/)
+    expect(componentsLayer).not.toBeNull()
+  })
+
+  it('lets .scrollbar-autohide own the sidebar scrollbar without legacy .sidebar-scroll-area overrides', () => {
+    const sidebarScrollAreaBlock = getThemeBlock('.sidebar-scroll-area')
+    expect(sidebarScrollAreaBlock).toContain('padding-bottom: 60px;')
+    expect(sidebarScrollAreaBlock).not.toContain('scrollbar-color')
+    expect(sidebarScrollAreaBlock).not.toContain('scrollbar-width')
+    expect(normalizedCss).not.toContain('.sidebar-scroll-area::-webkit-scrollbar')
   })
 })
 
@@ -550,8 +618,8 @@ describe('terminal palette tokens', () => {
 
   function terminalTokens(theme: string) {
     const blocks = [getThemeBlock(':root')]
-    if (theme === 'dark' || theme === 'ink-blue') {
-      blocks.push(getThemeBlock('[data-theme="dark"],\n[data-theme="ink-blue"]'))
+    if ((DARK_THEME_MODES as readonly string[]).includes(theme)) {
+      blocks.push(getThemeBlock(DARK_THEME_MODES.map((mode) => `[data-theme="${mode}"]`).join(',\n')))
     }
     blocks.push(getThemeBlock(`[data-theme="${theme}"]`))
     const tokens = new Map(Array.from(blocks.join('\n').matchAll(/(--[\w-]+):\s*([^;]+);/g), (match) => [match[1]!, match[2]!.trim()]))

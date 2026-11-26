@@ -24,12 +24,14 @@ import {
 import { setComposerText, stubRangeGeometry } from './composerTestUtils'
 import { relativizeWorkspacePath } from './CurrentTurnChangeCard'
 import { sessionsApi } from '../../api/sessions'
+import { wsManager } from '@/api/websocket'
 import { ApiError } from '../../api/client'
 import { subagentsApi, type SubagentRunResponse } from '../../api/subagents'
 import { teamsApi } from '../../api/teams'
 import { resetAgentRunActivityCache } from './useAgentRunActivity'
 import { resetWorkspaceFileStatsForTests } from '../../lib/workspaceFileStats'
-import { useChatStore } from '../../stores/chatStore'
+import { mapHistoryMessagesToUiMessages, reconstructRunActivityFromTranscript, useChatStore } from '../../stores/chatStore'
+import { buildSessionActivityModel } from '@/components/activity/sessionActivityModel'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
 import { useSettingsStore } from '../../stores/settingsStore'
@@ -462,6 +464,44 @@ describe('MessageList nested tool calls', () => {
     const className = screen.getByRole('img', { name: 'single.png' }).className
     expect(className).toContain('max-h-[340px]')
     expect(className).toContain('max-w-[360px]')
+  })
+
+  it.each(['stop', 'send queued message'])('keeps returned images with their tool rows after %s', (action) => {
+    vi.spyOn(wsManager, 'isConnected').mockReturnValue(true)
+    vi.spyOn(wsManager, 'send').mockImplementation(() => {})
+    vi.stubGlobal('URL', class extends URL {
+      static createObjectURL() { return 'blob:test-picture' }
+      static revokeObjectURL() {}
+    })
+    const picture = [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } }]
+    const messages: UIMessage[] = [
+      { type: 'tool_use', id: 'read-a', toolUseId: 'a', toolName: 'Read', input: { file_path: '/tmp/a.png' }, timestamp: 1 },
+      { type: 'tool_result', id: 'result-a', toolUseId: 'a', content: picture, isError: false, timestamp: 2 },
+      { type: 'tool_use', id: 'command', toolUseId: 'cmd', toolName: 'Bash', input: { command: 'pwd' }, timestamp: 3 },
+      { type: 'tool_result', id: 'result-cmd', toolUseId: 'cmd', content: '/tmp', isError: false, timestamp: 4 },
+      { type: 'tool_use', id: 'read-b', toolUseId: 'b', toolName: 'Read', input: { file_path: '/tmp/b.png' }, timestamp: 5 },
+      { type: 'tool_result', id: 'result-b', toolUseId: 'b', content: picture, isError: false, timestamp: 6 },
+    ]
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages, chatState: 'thinking' }) } })
+    const { container } = render(<MessageList sessionId={ACTIVE_TAB} />)
+    const rowOrder = () => Array.from(container.querySelectorAll('[data-tool-use-id]'), row => [
+      row.getAttribute('data-tool-use-id'), row.querySelectorAll('[data-tool-result-images] img').length,
+    ])
+    const expected = [['a', 1], ['cmd', 0], ['b', 1]]
+    expect(rowOrder()).toEqual(expected)
+
+    act(() => {
+      const store = useChatStore.getState()
+      if (action === 'stop') store.stopGeneration(ACTIVE_TAB)
+      else {
+        const id = store.queueUserMessage(ACTIVE_TAB, { content: 'Follow up', displayContent: 'Follow up' })
+        store.sendQueuedUserMessage(ACTIVE_TAB, id)
+      }
+    })
+
+    if (action === 'send queued message') expect(screen.getByText('Follow up')).toBeTruthy()
+    expect(rowOrder()).toEqual(expected)
+    expect(container.querySelectorAll('[data-tool-result-images]')).toHaveLength(2)
   })
 
   it('navigates from a user attachment through assistant and tool images in the same session', () => {
@@ -1838,201 +1878,105 @@ describe('MessageList nested tool calls', () => {
     expect(screen.queryByText('Goal status')).toBeNull()
   })
 
-  it('renders non-agent background progress inline in the transcript', () => {
-    useChatStore.setState({
-      sessions: {
-        [ACTIVE_TAB]: makeSessionState({
-          messages: [
-            {
-              id: 'user-1',
-              type: 'user_text',
-              content: 'run review',
-              timestamp: 1,
-            },
-            {
-              id: 'background-task-shell-1',
-              type: 'background_task',
-              timestamp: 2,
-              task: {
-                taskId: 'shell-task-1',
-                toolUseId: 'shell-tool-1',
-                status: 'running',
-                taskType: 'local_bash',
-                summary: 'Running Playwright checks',
-                usage: {
-                  totalTokens: 1200,
-                  toolUses: 4,
-                  durationMs: 45000,
-                },
-                startedAt: 2,
-                updatedAt: 2,
-              },
-            },
-            {
-              id: 'assistant-1',
-              type: 'assistant_text',
-              content: 'continuing',
-              timestamp: 3,
-            },
-          ],
-        }),
-      },
-    })
+  it.each(['running', 'completed', 'failed', 'stopped'] as const)(
+    'keeps %s background lifecycle events out of the conversation',
+    (status) => {
+      const events: UIMessage[] = ['local_bash', 'local_workflow', undefined].map((taskType, index) => ({
+        id: `background-task-${index}`,
+        type: 'background_task',
+        timestamp: index + 2,
+        task: {
+          taskId: `task-${index}`,
+          taskType,
+          status,
+          summary: 'Background command "temporary server" failed with exit code 143',
+          startedAt: 1,
+          updatedAt: index + 2,
+        },
+      }))
+      const messages: UIMessage[] = [
+        { id: 'user', type: 'user_text', content: 'Run the checks', timestamp: 1 },
+        ...events,
+        { id: 'reply', type: 'assistant_text', content: 'The checks found an issue that needs fixing.', timestamp: 6 },
+      ]
+      useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages }) } })
+
+      render(<MessageList />)
+
+      expect(screen.queryByTestId('background-task-event-card')).toBeNull()
+      expect(screen.queryByText(/exit code 143/)).toBeNull()
+      expect(screen.getByText('The checks found an issue that needs fixing.')).toBeTruthy()
+      expect(buildRenderModel(messages).renderItems).toEqual([
+        { kind: 'message', message: messages[0] },
+        { kind: 'message', message: messages.at(-1) },
+      ])
+      // Presentation leaves the lifecycle evidence available to Activity/trace.
+      expect(useChatStore.getState().sessions[ACTIVE_TAB]?.messages).toEqual(messages)
+    },
+  )
+
+  it.each([{ taskIds: ['task-1'] }, { taskIds: [] }])('hides structured background continuation notices ($taskIds) without hiding regular system messages or useful replies', ({ taskIds }) => {
+    const messages: UIMessage[] = [
+      { id: 'notice', type: 'system', content: 'Background task completed; continuing automatically: exit code 143', backgroundContinueTaskIds: taskIds, timestamp: 1 },
+      { id: 'reply', type: 'assistant_text', content: 'The build failed because a dependency is missing.', timestamp: 2 },
+      { id: 'system', type: 'system', content: 'Connection restored', timestamp: 3 },
+      // User-authored text must never be filtered by matching notification wording.
+      { id: 'user', type: 'user_text', content: 'Background task completed; continuing automatically', timestamp: 4 },
+    ]
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages }) } })
 
     render(<MessageList />)
 
-    const card = screen.getByTestId('background-task-event-card')
-    expect(card.textContent).toContain('Background command')
-    expect(card.textContent).toContain('running')
-    expect(card.textContent).toContain('Running Playwright checks')
-    expect(card.textContent).toContain('1.2k tokens')
-    expect(card.textContent).toContain('45s')
+    expect(screen.queryByText(/exit code 143/)).toBeNull()
+    expect(screen.getByText('The build failed because a dependency is missing.')).toBeTruthy()
+    expect(screen.getByText('Connection restored')).toBeTruthy()
+    expect(screen.getByText('Background task completed; continuing automatically')).toBeTruthy()
+    expect(buildRenderModel(messages).renderItems.map((item) => item.kind === 'message' && item.message.id)).toEqual(['reply', 'system', 'user'])
   })
 
-  it('localizes non-agent background task duration units', () => {
-    useSettingsStore.setState({ locale: 'zh' })
-    useChatStore.setState({
-      sessions: {
-        [ACTIVE_TAB]: makeSessionState({
-          messages: [
-            {
-              id: 'background-task-shell-1',
-              type: 'background_task',
-              timestamp: 2,
-              task: {
-                taskId: 'shell-task-1',
-                toolUseId: 'shell-tool-1',
-                // `stopped`, not `completed`: a cleanly finished task is left to
-                // the activity panel now. What this asserts is duration
-                // formatting, which does not depend on which end state it is.
-                status: 'stopped',
-                taskType: 'local_bash',
-                summary: 'Running Playwright checks',
-                usage: {
-                  totalTokens: 1200,
-                  toolUses: 4,
-                  durationMs: 65000,
-                },
-                startedAt: 2,
-                updatedAt: 2,
-              },
-            },
-          ],
-        }),
-      },
+  it('keeps reloaded background failures in Activity while hiding both current and legacy wake-up rows', () => {
+    const failure = 'Background command "temporary server" failed with exit code 143'
+    const history: MessageEntry[] = [
+      { id: 'tool', type: 'tool_use', timestamp: '2026-11-17T00:00:00.000Z', content: [{ type: 'tool_use', id: 'shell-2', name: 'Bash', input: { command: 'sleep 20', run_in_background: true } }] },
+      { id: 'result', type: 'tool_result', timestamp: '2026-11-17T00:00:00.500Z', content: [{ type: 'tool_result', tool_use_id: 'shell-2', content: 'Command running in background with ID: task-2. Output is being written to: /tmp/task-2.output' }] },
+      { id: 'projected', type: 'system', timestamp: '2026-11-17T00:00:01.000Z', content: {
+        subtype: 'background_continue', notifications: [{ taskId: 'task-1', status: 'failed', summary: failure }],
+      } },
+      { id: 'legacy', type: 'user', timestamp: '2026-11-17T00:00:02.000Z', content: `<task-notification><task-id>task-2</task-id><tool-use-id>shell-2</tool-use-id><status>failed</status><summary>${failure}</summary><output-file>/tmp/task-2.output</output-file></task-notification>` },
+      { id: 'reply', type: 'assistant', timestamp: '2026-11-17T00:00:03.000Z', content: [{ type: 'text', text: 'Validation is complete.' }] },
+    ]
+    const messages = mapHistoryMessagesToUiMessages(history)
+    const restored = reconstructRunActivityFromTranscript(history)
+    const activity = buildSessionActivityModel({
+      sessionId: ACTIVE_TAB,
+      messages,
+      tasks: [],
+      completedAndDismissed: false,
+      backgroundTasks: Object.values(restored.backgroundAgentTasks),
+      agentNotifications: [],
     })
 
-    render(<MessageList />)
-
-    expect(screen.getByTestId('background-task-event-card').textContent).toContain('1 分 5 秒')
+    expect(messages.some((message) => message.type === 'system' && message.backgroundContinueTaskIds?.length)).toBe(true)
+    expect(activity.sections.backgroundTasks.rows).toContainEqual(expect.objectContaining({
+      taskId: 'task-2', status: 'failed', summary: failure, outputFile: '/tmp/task-2.output',
+    }))
+    expect(buildRenderModel(messages).renderItems).toMatchObject([
+      { kind: 'tool_group' },
+      { kind: 'message', message: { type: 'assistant_text', content: 'Validation is complete.' } },
+    ])
   })
 
-  it('leaves a completed background task to the activity panel, but keeps a failure', () => {
-    const task = (id: string, status: 'completed' | 'failed') => ({
-      id: `background-task-${id}`,
-      type: 'background_task' as const,
-      timestamp: 2,
-      task: {
-        taskId: id,
-        toolUseId: `${id}-tool`,
-        status,
-        taskType: 'local_bash',
-        summary: `Ran ${id}`,
-        startedAt: 1,
-        updatedAt: 2,
-      },
-    })
+  it('does not split tool activity around hidden task lifecycle messages', () => {
+    const messages: UIMessage[] = [
+      { id: 'tool-1', type: 'tool_use', toolUseId: 'bash-1', toolName: 'Bash', input: { command: 'echo first' }, timestamp: 1 },
+      { id: 'notice', type: 'system', content: 'Task completed', backgroundContinueTaskIds: ['task-1'], timestamp: 2 },
+      { id: 'event', type: 'background_task', task: { taskId: 'task-1', status: 'failed', startedAt: 1, updatedAt: 3 }, timestamp: 3 },
+      { id: 'tool-2', type: 'tool_use', toolUseId: 'bash-2', toolName: 'Bash', input: { command: 'echo second' }, timestamp: 4 },
+    ]
 
-    useChatStore.setState({
-      sessions: {
-        [ACTIVE_TAB]: makeSessionState({ messages: [task('done-1', 'completed'), task('broke-1', 'failed')] }),
-      },
-    })
-
-    render(<MessageList />)
-
-    // A team session emits dozens of "task completed" reports and the panel
-    // already lists every one of them; repeating each as a card buries the
-    // conversation. A failure still interrupts — it changes what the turn means,
-    // and the panel it would otherwise live in can be closed.
-    const cards = screen.getAllByTestId('background-task-event-card')
-    expect(cards).toHaveLength(1)
-    expect(cards[0]?.textContent).toContain('broke-1')
-  })
-
-  it('renders stopped non-agent background tasks as neutral transcript events', () => {
-    useChatStore.setState({
-      sessions: {
-        [ACTIVE_TAB]: makeSessionState({
-          messages: [{
-            id: 'background-task-shell-stopped',
-            type: 'background_task',
-            timestamp: 2,
-            task: {
-              taskId: 'shell-task-stopped',
-              toolUseId: 'shell-tool-stopped',
-              status: 'stopped',
-              taskType: 'local_bash',
-              summary: 'Command "bun test" was stopped',
-              startedAt: 1,
-              updatedAt: 2,
-            },
-          }],
-        }),
-      },
-    })
-
-    render(<MessageList />)
-
-    const card = screen.getByTestId('background-task-event-card')
-    expect(card.getAttribute('data-status')).toBe('stopped')
-    expect(card.textContent).toContain('stopped')
-    expect(card.querySelector('.text-\\[var\\(--color-error\\)\\]')).toBeNull()
-  })
-
-  it('uses user-facing labels for workflow and unknown background tasks', () => {
-    useChatStore.setState({
-      sessions: {
-        [ACTIVE_TAB]: makeSessionState({
-          messages: [
-            {
-              id: 'background-task-workflow',
-              type: 'background_task',
-              timestamp: 2,
-              task: {
-                taskId: 'workflow-task',
-                status: 'running',
-                taskType: 'local_workflow',
-                summary: 'Running release checklist',
-                startedAt: 1,
-                updatedAt: 2,
-              },
-            },
-            {
-              id: 'background-task-unknown',
-              type: 'background_task',
-              timestamp: 3,
-              task: {
-                taskId: 'unknown-task',
-                // See above: the label is what this asserts, and a cleanly
-                // finished task no longer draws a card to read it off.
-                status: 'stopped',
-                summary: 'Finished background work',
-                startedAt: 1,
-                updatedAt: 3,
-              },
-            },
-          ],
-        }),
-      },
-    })
-
-    render(<MessageList />)
-
-    const cards = screen.getAllByTestId('background-task-event-card')
-    expect(cards).toHaveLength(2)
-    expect(cards[0]?.textContent).toContain('Background workflow')
-    expect(cards[1]?.textContent).toContain('Background task')
+    expect(buildRenderModel(messages).renderItems).toMatchObject([
+      { kind: 'tool_group', toolCalls: [{ toolUseId: 'bash-1' }, { toolUseId: 'bash-2' }] },
+    ])
   })
 
   it('does not render agent background task events as separate transcript cards', () => {
@@ -7447,6 +7391,185 @@ describe('MessageList nested tool calls', () => {
     expect(within(unrelatedReply).queryByRole('region', { name: 'Turn changed files' })).toBeNull()
   })
 
+  it.each(['history refresh', 'background work'] as const)('keeps an expanded file card mounted during %s without allowing undo', async (phase) => {
+    const messages: UIMessage[] = [
+      { id: 'user-edit', type: 'user_text', content: 'Update the docs', timestamp: 1 },
+      { id: 'assistant-edit', type: 'assistant_text', content: 'Updated.', timestamp: 2 },
+    ]
+    const checkpoint = {
+      target: { targetUserMessageId: 'user-edit', userMessageIndex: 0, userMessageCount: 1 },
+      code: { available: true, filesChanged: Array.from({ length: 41 }, (_, i) => `docs/page-${i}.md`), insertions: 41, deletions: 0 },
+    }
+    const response = { checkpoints: [checkpoint] }
+    const getTurnCheckpoints = vi.mocked(sessionsApi.getTurnCheckpoints).mockResolvedValueOnce(response)
+    let resolveRefresh!: (value: typeof response) => void
+    getTurnCheckpoints.mockImplementationOnce(() => new Promise(resolve => { resolveRefresh = resolve }))
+    const setSession = (overrides: Partial<PerSessionState> = {}) => {
+      useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages, ...overrides }) } })
+    }
+    setSession()
+    render(<MessageList />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Show 41 changed files' }))
+    const card = screen.getByRole('region', { name: 'Turn changed files' })
+    const file = within(card).getByRole('button', { name: 'Open docs/page-0.md in workspace' })
+    const undo = within(card).getByRole('button', { name: 'Undo current turn changes' }) as HTMLButtonElement
+    expect(undo.disabled).toBe(false)
+
+    act(() => setSession(phase === 'history refresh' ? { historyStatus: 'loading' } : {
+      backgroundAgentTasks: {
+        review: { taskId: 'review', taskType: 'local_agent', status: 'running', startedAt: 3, updatedAt: 3 },
+      },
+    }))
+    expect(getTurnCheckpoints).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('region', { name: 'Turn changed files' })).toBe(card)
+    expect(within(card).getByRole('button', { name: 'Open docs/page-0.md in workspace' })).toBe(file)
+    expect(undo.disabled).toBe(true)
+    fireEvent.click(undo)
+    expect(screen.queryByRole('dialog')).toBeNull()
+
+    act(() => setSession())
+    expect(getTurnCheckpoints).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('region', { name: 'Turn changed files' })).toBe(card)
+    expect(undo.disabled).toBe(true)
+    await act(async () => resolveRefresh(response))
+    expect(screen.getByRole('region', { name: 'Turn changed files' })).toBe(card)
+    expect(within(card).getByRole('button', { name: 'Open docs/page-0.md in workspace' })).toBe(file)
+    expect(undo.disabled).toBe(false)
+    fireEvent.click(undo)
+    expect(screen.getByRole('dialog', { name: 'Undo current turn?' })).toBeTruthy()
+  })
+
+  it('blocks both undo modes until a running reconnect settles and its checkpoints are refreshed', async () => {
+    const messages: UIMessage[] = [
+      { id: 'prompt-a', transcriptMessageId: 'prompt-a', type: 'user_text', content: 'Edit tracked docs', timestamp: 1 },
+      { id: 'answer-a', type: 'assistant_text', content: 'Edited the docs.', timestamp: 2 },
+    ]
+    const response = { checkpoints: [{
+      target: { targetUserMessageId: 'prompt-a', userMessageIndex: 0, userMessageCount: 1 },
+      code: { available: true, filesChanged: ['docs/page.md'], insertions: 1, deletions: 0 },
+    }] }
+    let resolveCheckpoints!: (value: typeof response) => void
+    const getCheckpoints = vi.mocked(sessionsApi.getTurnCheckpoints)
+      .mockResolvedValueOnce(response)
+      .mockReturnValueOnce(new Promise(resolve => { resolveCheckpoints = resolve }))
+    const history: { messages: MessageEntry[] } = { messages: [
+      { id: 'prompt-a', type: 'user', content: 'Edit tracked docs', timestamp: new Date(1).toISOString() },
+      { id: 'answer-a', type: 'assistant', content: 'Edited the docs.', timestamp: new Date(2).toISOString() },
+      { id: 'prompt-b', type: 'user', content: 'Continue the review', timestamp: new Date(3).toISOString() },
+    ] }
+    let resolveHistory!: (value: typeof history) => void
+    const loadHistory = vi.spyOn(sessionsApi, 'getFullHistory')
+      .mockReturnValueOnce(new Promise(resolve => { resolveHistory = resolve }))
+    const rewind = vi.spyOn(sessionsApi, 'rewind').mockImplementation(() => new Promise(() => {}))
+    const stop = vi.spyOn(useChatStore.getState(), 'stopGeneration').mockImplementation(() => {})
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages }) } })
+    render(<MessageList />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Undo current turn changes' }))
+    const assertUndoDisabled = () => {
+      const dialog = screen.getByRole('dialog', { name: 'Undo current turn?' })
+      for (const name of ['Undo current turn', 'Roll back conversation only']) {
+        const button = within(dialog).getByRole<HTMLButtonElement>('button', { name })
+        expect(button.disabled).toBe(true)
+        fireEvent.click(button)
+      }
+      expect(rewind).not.toHaveBeenCalled()
+      expect(stop).not.toHaveBeenCalled()
+    }
+
+    try {
+      act(() => {
+        useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({
+          messages: [...messages, { id: 'prompt-b', type: 'user_text', content: 'Continue the review', timestamp: 3 }],
+          chatState: 'thinking', awaitingReconnectSync: true, streamAttemptStartIndex: 3,
+        }) } })
+        useChatStore.getState().handleServerMessage(ACTIVE_TAB, { type: 'session_state', turnState: 'running', activeBackgroundTaskIds: [] })
+      })
+      expect(loadHistory).toHaveBeenCalledTimes(1)
+      expect(useChatStore.getState().sessions[ACTIVE_TAB]?.historyStatus).toBe('loading')
+      assertUndoDisabled()
+      await act(async () => resolveHistory(history))
+      expect(useChatStore.getState().sessions[ACTIVE_TAB]).toMatchObject({ historyStatus: 'ready', chatState: 'thinking' })
+      expect(getCheckpoints).toHaveBeenCalledTimes(1)
+      expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Undo current turn changes' }).disabled).toBe(true)
+      assertUndoDisabled()
+
+      act(() => useChatStore.getState().handleServerMessage(ACTIVE_TAB, { type: 'status', state: 'idle' }))
+      expect(getCheckpoints).toHaveBeenCalledTimes(2)
+      assertUndoDisabled()
+      await act(async () => resolveCheckpoints(response))
+      const dialog = screen.getByRole('dialog', { name: 'Undo current turn?' })
+      const confirm = within(dialog).getByRole<HTMLButtonElement>('button', { name: 'Undo current turn' })
+      expect(confirm.disabled).toBe(false)
+      fireEvent.click(confirm)
+      expect(rewind).toHaveBeenCalledExactlyOnceWith(ACTIVE_TAB, {
+        targetUserMessageId: 'prompt-a', userMessageIndex: 0, expectedContent: 'Edit tracked docs', mode: 'both',
+      })
+      expect(stop).not.toHaveBeenCalled()
+    } finally {
+      act(() => useChatStore.getState().handleServerMessage(ACTIVE_TAB, { type: 'status', state: 'idle' }))
+    }
+  })
+
+  it('keeps all 41 files expanded when an idle reconnect replaces local message ids', async () => {
+    clearDisclosureMemory()
+    const messages: UIMessage[] = [
+      { id: 'live-prompt', type: 'user_text', content: 'Update the docs', timestamp: 1 },
+      { id: 'live-answer', type: 'assistant_text', content: 'Updated the docs.', timestamp: 2 },
+    ]
+    const history: { messages: MessageEntry[] } = { messages: [
+      { id: 'recorded-prompt', type: 'user', content: 'Update the docs', timestamp: new Date(1).toISOString() },
+      { id: 'recorded-answer', type: 'assistant', content: 'Updated the docs.', timestamp: new Date(2).toISOString() },
+    ] }
+    const response = { checkpoints: [{
+      target: { targetUserMessageId: 'recorded-prompt', userMessageIndex: 0, userMessageCount: 1 },
+      code: { available: true, filesChanged: Array.from({ length: 41 }, (_, i) => `docs/page-${i}.md`), insertions: 41, deletions: 0 },
+    }] }
+    let resolveCheckpoints!: (value: typeof response) => void
+    const getCheckpoints = vi.mocked(sessionsApi.getTurnCheckpoints)
+      .mockResolvedValueOnce(response)
+      .mockReturnValueOnce(new Promise(resolve => { resolveCheckpoints = resolve }))
+    let resolveHistory!: (value: typeof history) => void
+    vi.spyOn(sessionsApi, 'getFullHistory').mockReturnValueOnce(new Promise(resolve => { resolveHistory = resolve }))
+    vi.spyOn(wsManager, 'connect').mockImplementation(() => {})
+    const stateHandler = vi.spyOn(wsManager, 'onConnectionState').mockReturnValue(() => {})
+    const messageHandler = vi.spyOn(wsManager, 'onMessage').mockReturnValue(() => {})
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ connectionState: 'disconnected' }) } })
+    useChatStore.getInitialState().connectToSession(ACTIVE_TAB, { minimalBootstrap: true, prewarm: false, applyRuntimeSelection: false })
+    const onConnectionState = stateHandler.mock.lastCall![1]
+    const onMessage = messageHandler.mock.lastCall![1]
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages }) } })
+    render(<MessageList />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Show 41 changed files' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Show 36 more files' }))
+    const mountedCard = screen.getByRole('region', { name: 'Turn changed files' })
+    const assertExpanded = (rowId: string) => {
+      const card = screen.getByRole('region', { name: 'Turn changed files' })
+      // 废弃旧 DOM 会让浏览器失去滚动锚点，即便新卡片仍然展开。
+      expect(card === mountedCard).toBe(true)
+      expect(card.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe(rowId)
+      expect(within(card).getByRole('button', { name: 'Hide changed files' }).getAttribute('aria-expanded')).toBe('true')
+      expect(within(card).getAllByRole('button', { name: /Open docs\/page-\d+\.md in workspace/ })).toHaveLength(41)
+      return within(card).getByRole<HTMLButtonElement>('button', { name: 'Undo current turn changes' })
+    }
+    expect(assertExpanded('live-answer').disabled).toBe(false)
+
+    act(() => onConnectionState('reconnecting'))
+    expect(useChatStore.getState().sessions[ACTIVE_TAB]).toMatchObject({ historyHydrated: false, awaitingReconnectSync: true })
+    expect(assertExpanded('live-answer').disabled).toBe(true)
+    act(() => onConnectionState('connected'))
+    expect(assertExpanded('live-answer').disabled).toBe(true)
+    act(() => onMessage({ type: 'session_state', turnState: 'idle', activeBackgroundTaskIds: [] }))
+    expect(useChatStore.getState().sessions[ACTIVE_TAB]?.historyStatus).toBe('loading')
+    expect(assertExpanded('live-answer').disabled).toBe(true)
+    await act(async () => resolveHistory(history))
+    expect(useChatStore.getState().sessions[ACTIVE_TAB]?.messages.map(message => message.id)).toEqual(['recorded-prompt', 'recorded-answer'])
+    // 已经切换到落盘行，但新的检查点请求尚未返回。
+    expect(assertExpanded('recorded-answer').disabled).toBe(true)
+    expect(getCheckpoints).toHaveBeenCalledTimes(2)
+    await act(async () => resolveCheckpoints(response))
+    expect(assertExpanded('recorded-answer').disabled).toBe(false)
+  })
+
   it('returns focus to the change summary when its file list was collapsed with the diff open', async () => {
     vi.mocked(sessionsApi.getTurnCheckpoints).mockResolvedValue({ checkpoints: [{
       target: { targetUserMessageId: 'user-origin-file', userMessageIndex: 0, userMessageCount: 1 },
@@ -8019,7 +8142,7 @@ describe('MessageList nested tool calls', () => {
     expect(await screen.findByText('blank-response.ts')).toBeTruthy()
   })
 
-  it('keeps checkpoint evidence while hiding change cards for a running background task', async () => {
+  it('keeps checkpoint evidence and change cards visible when background work runs and settles', async () => {
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
       checkpoints: [
         {
@@ -8062,7 +8185,7 @@ describe('MessageList nested tool calls', () => {
     render(<MessageList />)
 
     await expandChangedFileCards()
-    expect(await screen.findByText('first.ts')).toBeTruthy()
+    const fileRow = await screen.findByText('first.ts')
     expect(screen.queryByText('Markdown')).toBeNull()
 
     act(() => {
@@ -8086,9 +8209,7 @@ describe('MessageList nested tool calls', () => {
       })
     })
 
-    await waitFor(() => {
-      expect(screen.queryByText('first.ts')).toBeNull()
-    })
+    expect(screen.getByText('first.ts')).toBe(fileRow)
     expect(screen.queryByText('Markdown')).toBeNull()
 
     act(() => {
@@ -8112,9 +8233,7 @@ describe('MessageList nested tool calls', () => {
       })
     })
 
-    await waitFor(() => {
-      expect(screen.getByText('first.ts')).toBeTruthy()
-    })
+    expect(screen.getByText('first.ts')).toBe(fileRow)
     expect(screen.queryByText('Markdown')).toBeNull()
   })
 
@@ -8607,8 +8726,7 @@ describe('MessageList nested tool calls', () => {
       'This will rewind the conversation to before this turn. Files on disk will not be changed.',
     )).toBeTruthy()
     expect(within(dialog).queryByRole('button', { name: 'Undo current turn' })).toBeNull()
-    // History renders before its checkpoint cards reload. Hold that request so
-    // the assertion cannot accidentally pass on a stale card from the old turn.
+    // 历史先于检查点刷新；检查删掉的回合已不可撤销，保留的回合仍可阅读。
     let resolveCheckpointReload!: (response: Awaited<ReturnType<typeof sessionsApi.getTurnCheckpoints>>) => void
     const checkpointReload = new Promise<Awaited<ReturnType<typeof sessionsApi.getTurnCheckpoints>>>((resolve) => {
       resolveCheckpointReload = resolve
@@ -8630,7 +8748,10 @@ describe('MessageList nested tool calls', () => {
       expect(messages.some((message) => message.type === 'error')).toBe(false)
     })
     expect(screen.getByRole('link', { name: 'src/kept.ts' }).getAttribute('data-file-path')).toBe('src/kept.ts')
-    expect(screen.queryByText('kept.ts')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Open src/kept.ts in workspace' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Roll back conversation' })).toBeNull()
+    const retainedCard = screen.getByRole('region', { name: 'Turn changed files' })
+    expect(within(retainedCard).getByRole<HTMLButtonElement>('button', { name: 'Rewind to before this turn' }).disabled).toBe(true)
     await act(async () => {
       resolveCheckpointReload({
         checkpoints: [
@@ -8650,8 +8771,8 @@ describe('MessageList nested tool calls', () => {
         ],
       })
     })
-    await expandChangedFileCards()
-    expect(await screen.findByText('kept.ts')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open src/kept.ts in workspace' })).toBeTruthy()
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Undo current turn changes' }).disabled).toBe(false)
     expect(useChatStore.getState().sessions[ACTIVE_TAB]?.composerPrefill).toMatchObject({
       text: 'continue',
     })
@@ -10983,16 +11104,30 @@ describe('MessageList edit and resend', () => {
     expect(editButtonIn('Build a page').disabled).toBe(true)
   })
 
-  it('still edits a prompt past the checkpoint preview budget, rolling back the conversation only', async () => {
-    const { sendMessage } = setup(oneTurn, [])
-    vi.mocked(sessionsApi.getTurnCheckpoints).mockRejectedValue(new ApiError(413, { error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT' }))
+  it.each(['initial load', 'refresh with undo confirmation open'] as const)('still edits a prompt after the checkpoint preview exceeds budget on %s', async (phase) => {
+    const { sendMessage } = setup(oneTurn, [checkpoint('user-1', 0, 1, {
+      code: { available: true, filesChanged: ['app.ts'], insertions: 1, deletions: 0 },
+    })])
+    const getCheckpoints = vi.mocked(sessionsApi.getTurnCheckpoints)
+    const overBudget = new ApiError(413, { error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT' })
+    if (phase === 'initial load') getCheckpoints.mockRejectedValue(overBudget)
     // The dry run finds changed files; this mode has told the user file undo
     // is unavailable, so they must not be offered back.
     const rewind = vi.spyOn(sessionsApi, 'rewind').mockResolvedValue(rewindResult({
       code: { available: true, filesChanged: ['app.ts'], insertions: 1, deletions: 0 },
     }))
     render(<MessageList />)
+    if (phase === 'refresh with undo confirmation open') {
+      fireEvent.click(await screen.findByRole('button', { name: 'Undo current turn changes' }))
+      expect(screen.getByRole('dialog', { name: 'Undo current turn?' })).toBeTruthy()
+      getCheckpoints.mockRejectedValue(overBudget)
+      act(() => useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({
+        messages: oneTurn, historyMutationEpoch: 1,
+      }) } }))
+    }
     await screen.findByRole('region', { name: 'Workspace changed files' })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(rewind).not.toHaveBeenCalled()
 
     typeAndSend(await openEditorFor('Build a page'), 'Build a landing page')
 

@@ -6,6 +6,7 @@ import { getSessionCollaborationService } from './services/sessionCollaborationH
 
 import { handleSessionsApi } from './api/sessions.js'
 import { handleMobilePushApi } from './api/mobilePush.js'
+import { handleMobileUpdateApi } from './api/mobileUpdate.js'
 import { handleSettingsApi } from './api/settings.js'
 import { handleModelsApi } from './api/models.js'
 import { handleScheduledTasksApi } from './api/scheduled-tasks.js'
@@ -222,7 +223,10 @@ async function routeApiRequest(req: Request, url: URL): Promise<Response> {
       return handleTracesApi(req, url, segments)
 
     case 'filesystem':
-      return handleFilesystemRoute(url.pathname, url, req.signal)
+      return handleFilesystemRoute(url.pathname, url, req.signal, req.headers)
+
+    case 'mobile-update':
+      return handleMobileUpdateApi(req, url, segments)
 
     default:
       return Response.json(

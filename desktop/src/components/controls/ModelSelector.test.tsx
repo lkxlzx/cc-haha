@@ -1310,13 +1310,33 @@ describe('ModelSelector', () => {
     expect(setSessionRuntime).toHaveBeenLastCalledWith('fast-session', expect.objectContaining({ openAIFastMode: false }))
   })
 
-  it('never offers the OAuth Fast switch for Claude Official or API-key providers', async () => {
-    useSettingsStore.setState({ locale: 'en', effortLevel: 'high' })
-    useProviderStore.setState({ providers: [], activeId: null, hasLoadedProviders: true })
+  it('offers Claude Fast mode (not OAuth openAIFastMode) for Claude Official and never offers Fast for non-Claude API-key providers', async () => {
+    const setFastMode = vi.fn().mockResolvedValue(undefined)
+    useSettingsStore.setState({ locale: 'en', effortLevel: 'high', fastMode: false, setFastMode })
+    useProviderStore.setState({
+      providers: [{
+        id: 'kimi', presetId: 'kimi', name: 'Kimi', apiFormat: 'anthropic',
+        apiKey: 'fixture', baseUrl: 'http://127.0.0.1:1',
+        models: { main: 'kimi-k2.5', haiku: '', sonnet: '', opus: '' },
+      }],
+      activeId: null,
+      hasLoadedProviders: true,
+    })
     useSessionRuntimeStore.getState().setSelection('claude-session', {
       providerId: null, modelId: 'claude-opus-4-8', effortLevel: 'high',
     })
-    render(<ModelSelector runtimeKey="claude-session" />)
+    const { rerender } = render(<ModelSelector runtimeKey="claude-session" />)
+    await clickByRole('Effort: High')
+    const claudeFastSwitch = screen.getByRole('switch', { name: 'Fast mode' })
+    expect(claudeFastSwitch).not.toBeDisabled()
+    fireEvent.click(claudeFastSwitch)
+    expect(setFastMode).toHaveBeenCalledWith(true)
+    expect(useSessionRuntimeStore.getState().selections['claude-session']?.openAIFastMode).toBeUndefined()
+
+    useSessionRuntimeStore.getState().setSelection('kimi-session', {
+      providerId: 'kimi', modelId: 'kimi-k2.5', effortLevel: 'high',
+    })
+    rerender(<ModelSelector runtimeKey="kimi-session" />)
     await clickByRole('Effort: High')
     expect(screen.queryByRole('switch', { name: 'Fast mode' })).not.toBeInTheDocument()
   })
@@ -1931,5 +1951,45 @@ describe('controlled runtime pickers outside the composer', () => {
     expect(within(picker).queryByText('Claude Official')).not.toBeInTheDocument()
     fireEvent.click(within(picker).getByRole('button', { name: /^opus/ }))
     expect(onRuntimeSelectionChange).toHaveBeenCalledWith(expect.objectContaining({ providerId: '__session__', modelId: 'opus' }))
+  })
+
+  it('docks effort controls and permissions shortcut inside the frosted-glass model dropdown', async () => {
+    useSettingsStore.setState({ locale: 'en', effortLevel: 'high' })
+    useHahaOAuthStore.setState({ status: { loggedIn: true } as never })
+    useSessionRuntimeStore.getState().setSelection('session-docked', {
+      providerId: null,
+      modelId: 'claude-opus-4-8',
+      effortLevel: 'high',
+    })
+    const onOpenPermissions = vi.fn()
+    render(
+      <ModelSelector
+        runtimeKey="session-docked"
+        permissionModeLabel="Ask permissions"
+        onOpenPermissions={onOpenPermissions}
+      />,
+    )
+
+    await clickByRole('Opus 4.8, Claude Official')
+    const dropdown = screen.getByTestId('model-selector-dropdown')
+    expect(dropdown).toHaveClass('dropdown-glass', 'popover-motion', 'rounded-[var(--radius-lg)]')
+
+    const docked = within(dropdown).getByTestId('model-selector-docked-controls')
+    const maxEffort = within(docked).getByRole('radio', { name: 'Max' })
+    fireEvent.click(maxEffort)
+    // Inline effort switch updates selection without dismissing the dropdown.
+    expect(useSessionRuntimeStore.getState().selections['session-docked']?.effortLevel).toBe('max')
+    expect(screen.getByTestId('model-selector-dropdown')).toBeInTheDocument()
+
+    const permShortcut = within(docked).getByTestId('model-selector-permissions-shortcut')
+    expect(permShortcut.tagName).toBe('BUTTON')
+    expect(permShortcut).toHaveAttribute('type', 'button')
+    expect(permShortcut).not.toHaveAttribute('role', 'menuitem')
+    expect(permShortcut).toHaveTextContent('Ask permissions')
+    fireEvent.click(permShortcut)
+    await waitFor(() => {
+      expect(onOpenPermissions).toHaveBeenCalledTimes(1)
+    })
+    expect(screen.queryByTestId('model-selector-dropdown')).not.toBeInTheDocument()
   })
 })

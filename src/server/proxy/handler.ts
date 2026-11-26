@@ -13,6 +13,19 @@ import { getOpenAIPolicyError } from '../../services/openaiAuth/policyError.js'
 import { INVALID_PROVIDER_KEY_HEADER, isInvalidSavedProviderKey } from '../../shared/providerCredentialError.js'
 import { inspectProviderUsageError } from '../../shared/providerUsageLimit.js'
 import { buildOpenaiEndpoint } from './openaiEndpoint.js'
+import { buildBedrockConverseEndpoint } from './bedrockEndpoint.js'
+import {
+  buildBedrockRequestHeaders,
+  buildOpenaiAuthHeaders,
+  buildVertexServiceTierHeaders,
+  resolveVertexAuthHeaders,
+} from './cloudAuth.js'
+import {
+  buildGeminiEndpoint,
+  buildVertexAnthropicEndpoint,
+  isVertexAnthropicTarget,
+  isVertexEndpointUrl,
+} from './geminiEndpoint.js'
 import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.js'
 import { buildProviderMediaFetch } from '../../services/api/providerMedia/fetch.js'
 import { brotliDecompressSync, createGunzip, createInflate, gunzipSync, inflateSync } from 'node:zlib'
@@ -50,6 +63,8 @@ import { openaiChatStreamToAnthropic } from './streaming/openaiChatStreamToAnthr
 import { openaiResponsesStreamToAnthropic } from './streaming/openaiResponsesStreamToAnthropic.js'
 import { anthropicToGemini, type GeminiRequest } from './transform/anthropicToGemini.js'
 import { GeminiUpstreamError, geminiErrorMessage, geminiResponseToAnthropic, geminiStreamToAnthropic } from './streaming/geminiStreamToAnthropic.js'
+import { anthropicToBedrockConverse } from './transform/anthropicToBedrockConverse.js'
+import { bedrockConverseResponseToAnthropic, bedrockConverseStreamToAnthropic } from './streaming/bedrockConverseToAnthropic.js'
 import type { AnthropicRequest } from './transform/types.js'
 import { getProxyFetchOptions } from '../../utils/proxy.js'
 import {
@@ -125,19 +140,32 @@ function wasTraceErrorRecorded(error: unknown): boolean {
   return Boolean(error && typeof error === 'object' && (error as Record<symbol, unknown>)[TRACE_RECORDED_ERROR_MARKER])
 }
 
-function createTimeoutController(timeoutMs: number): {
-  signal: AbortSignal
-  clear: () => void
-} {
-  const controller = new AbortController()
-  const timer = setTimeout(() => {
-    controller.abort(new DOMException('The operation timed out.', 'TimeoutError'))
-  }, timeoutMs)
+const CLIENT_CLOSED_REQUEST_STATUS = 499
 
-  return {
-    signal: controller.signal,
-    clear: () => clearTimeout(timer),
+function isAbortLikeError(error: unknown): boolean {
+  return (
+    (error instanceof Error || (typeof DOMException !== 'undefined' && error instanceof DOMException)) &&
+    (error.name === 'AbortError' || error.name === 'TimeoutError')
+  )
+}
+
+function toAbortError(reason?: unknown, fallbackMessage = 'The operation was aborted.'): Error {
+  if (reason instanceof Error) {
+    if (reason.name === 'Error') {
+      const wrapped = new Error(reason.message)
+      wrapped.name = 'AbortError'
+      return wrapped
+    }
+    return reason
   }
+  const message = reason !== undefined ? String(reason) : fallbackMessage
+  return new DOMException(message, 'AbortError')
+}
+
+type UpstreamFetchLease = {
+  response: Response
+  abortUpstream: (reason?: unknown) => void
+  dispose: () => void
 }
 
 async function fetchUpstreamWithTimeout(
@@ -146,7 +174,8 @@ async function fetchUpstreamWithTimeout(
   timeoutMs: number,
   isStream: boolean,
   onRequest?: (body: string, headers: Headers) => void,
-): Promise<Response> {
+  downstreamSignal?: AbortSignal,
+): Promise<UpstreamFetchLease> {
   // Convert media only after the protocol transform and final authentication.
   // Observe inference sends (including recovery), never multipart uploads, so
   // completion traces describe the actual upstream request.
@@ -158,31 +187,96 @@ async function fetchUpstreamWithTimeout(
     return fetch(input, requestInit)
   }) as typeof fetch)
   if (!isStream) {
-    return mediaFetch(url, {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs)
+    const signal = downstreamSignal
+      ? AbortSignal.any([timeoutSignal, downstreamSignal])
+      : timeoutSignal
+    const response = await mediaFetch(url, {
       ...init,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal,
     })
+    return {
+      response,
+      abortUpstream: () => {},
+      dispose: () => {},
+    }
   }
 
-  // For streaming requests, this timeout should only cover the connection and
-  // response headers. Keeping the signal alive aborts long generations mid-body.
-  const timeout = createTimeoutController(timeoutMs)
-  try {
-    return await mediaFetch(url, {
-      ...init,
-      signal: timeout.signal,
-    })
-  } finally {
-    timeout.clear()
+  // For streaming requests, the timeout only covers the connection and response
+  // headers so long generations are not killed mid-body — while the downstream
+  // client's abort signal stays linked until the stream finishes or cancels so
+  // Bun closes the upstream socket immediately on user Stop (#1917).
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+    timer = null
+    controller.abort(new DOMException('The operation timed out.', 'TimeoutError'))
+  }, timeoutMs)
+
+  const clearConnectTimeout = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
   }
+
+  const onDownstreamAbort = () => {
+    clearConnectTimeout()
+    if (!controller.signal.aborted) {
+      controller.abort(toAbortError(downstreamSignal?.reason))
+    }
+  }
+
+  if (downstreamSignal?.aborted) {
+    onDownstreamAbort()
+  } else if (downstreamSignal) {
+    downstreamSignal.addEventListener('abort', onDownstreamAbort, { once: true })
+  }
+
+  const dispose = () => {
+    clearConnectTimeout()
+    if (downstreamSignal) {
+      downstreamSignal.removeEventListener('abort', onDownstreamAbort)
+    }
+  }
+
+  const abortUpstream = (reason?: unknown) => {
+    dispose()
+    if (!controller.signal.aborted) {
+      controller.abort(toAbortError(reason))
+    }
+  }
+
+  try {
+    const response = await mediaFetch(url, {
+      ...init,
+      signal: controller.signal,
+    })
+    clearConnectTimeout()
+    return {
+      response,
+      abortUpstream,
+      dispose,
+    }
+  } catch (err) {
+    dispose()
+    throw err
+  }
+}
+
+export type StreamIdleTimeoutOptions = {
+  downstreamSignal?: AbortSignal
+  onAbortUpstream?: (reason?: unknown) => void
+  onCleanup?: () => void
 }
 
 export function withStreamIdleTimeout(
   upstream: ReadableStream<Uint8Array>,
   timeoutMs: number,
+  options?: StreamIdleTimeoutOptions,
 ): ReadableStream<Uint8Array> {
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
+  let cleanedUp = false
 
   const clearIdleTimer = () => {
     if (timer) {
@@ -191,17 +285,65 @@ export function withStreamIdleTimeout(
     }
   }
 
+  const cleanup = () => {
+    if (cleanedUp) return
+    cleanedUp = true
+    clearIdleTimer()
+    if (options?.downstreamSignal && onDownstreamAbort) {
+      options.downstreamSignal.removeEventListener('abort', onDownstreamAbort)
+    }
+    options?.onCleanup?.()
+  }
+
+  let onDownstreamAbort: (() => void) | null = null
+  let streamCancelled = false
+
   return new ReadableStream({
     async start(controller) {
       reader = upstream.getReader()
       let timedOut = false
+      let abortedDownstream = false
+
+      if (options?.downstreamSignal) {
+        onDownstreamAbort = () => {
+          if (abortedDownstream || timedOut || streamCancelled) return
+          abortedDownstream = true
+          clearIdleTimer()
+          const abortErr = toAbortError(options.downstreamSignal?.reason)
+          options.onAbortUpstream?.(abortErr)
+          cleanup()
+          void reader?.cancel(abortErr).catch(() => undefined)
+          // Defer controller.error by one microtask: when served by Bun.serve,
+          // Bun dispatches req.signal 'abort' and then synchronously cancels
+          // Response.body in the same turn; erroring the stream before that
+          // synchronous cancel surfaces an uncaught exception from Bun's HTTP sink.
+          queueMicrotask(() => {
+            if (streamCancelled) return
+            try {
+              controller.error(abortErr)
+            } catch {
+              // Stream may already be closed or cancelled.
+            }
+          })
+        }
+        if (options.downstreamSignal.aborted) {
+          onDownstreamAbort()
+          reader?.releaseLock()
+          reader = null
+          return
+        }
+        options.downstreamSignal.addEventListener('abort', onDownstreamAbort, { once: true })
+      }
 
       const armIdleTimer = () => {
         clearIdleTimer()
         timer = setTimeout(() => {
           timedOut = true
+          const timeoutError = new Error(`Upstream stream idle timeout after ${timeoutMs}ms`)
+          options?.onAbortUpstream?.(timeoutError)
+          cleanup()
           void reader?.cancel('stream idle timeout').catch(() => undefined)
-          controller.error(new Error(`Upstream stream idle timeout after ${timeoutMs}ms`))
+          controller.error(timeoutError)
         }, timeoutMs)
       }
 
@@ -210,23 +352,25 @@ export function withStreamIdleTimeout(
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
-          if (timedOut) break
+          if (timedOut || abortedDownstream) break
 
           controller.enqueue(value)
           armIdleTimer()
         }
-        clearIdleTimer()
-        if (!timedOut) controller.close()
+        cleanup()
+        if (!timedOut && !abortedDownstream) controller.close()
       } catch (err) {
-        clearIdleTimer()
-        if (!timedOut) controller.error(err)
+        cleanup()
+        if (!timedOut && !abortedDownstream) controller.error(err)
       } finally {
         reader?.releaseLock()
         reader = null
       }
     },
     cancel(reason) {
-      clearIdleTimer()
+      streamCancelled = true
+      options?.onAbortUpstream?.(reason)
+      cleanup()
       return reader?.cancel(reason)
     },
   })
@@ -271,6 +415,9 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
   try {
     body = (await req.json()) as AnthropicRequest
   } catch {
+    if (req.signal.aborted) {
+      return new Response(null, { status: CLIENT_CLOSED_REQUEST_STATUS })
+    }
     return Response.json(
       { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON in request body' } },
       { status: 400 },
@@ -367,15 +514,102 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
         resolvedApiFormat: apiFormat,
         supportsNestedToolResultMedia: config.supportsNestedToolResultMedia,
       })
-      return finalizeKeyResult(await handleAnthropicCompatible(body, upstreamBaseUrl, effectiveApiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext, upstreamHeaders, hoistNestedMedia))
+      return finalizeKeyResult(await handleAnthropicCompatible(body, upstreamBaseUrl, effectiveApiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext, upstreamHeaders, hoistNestedMedia, req.signal))
+    }
+    if (apiFormat === 'google_vertex') {
+      if (isVertexAnthropicTarget(upstreamBaseUrl, body.model)) {
+        return finalizeKeyResult(await handleVertexAnthropic(
+          body,
+          upstreamBaseUrl,
+          effectiveApiKey,
+          config.authStrategy,
+          req.headers,
+          isStream,
+          networkSettings,
+          traceContext,
+          requestOptions,
+          upstreamHeaders,
+          config.supportsNestedToolResultMedia,
+          req.signal,
+        ))
+      }
+      return finalizeKeyResult(await handleGemini(
+        body,
+        upstreamBaseUrl,
+        effectiveApiKey,
+        config.authStrategy === 'api_key',
+        isStream,
+        networkSettings,
+        traceContext,
+        requestOptions,
+        upstreamHeaders,
+        config.supportsNestedToolResultMedia,
+        req.signal,
+        { isVertex: true, authStrategy: config.authStrategy },
+      ))
     }
     if (apiFormat === 'gemini') {
-      return finalizeKeyResult(await handleGemini(body, upstreamBaseUrl, effectiveApiKey, config.authStrategy === 'api_key', isStream, networkSettings, traceContext, requestOptions, upstreamHeaders))
+      return finalizeKeyResult(await handleGemini(
+        body,
+        upstreamBaseUrl,
+        effectiveApiKey,
+        config.authStrategy === 'api_key',
+        isStream,
+        networkSettings,
+        traceContext,
+        requestOptions,
+        upstreamHeaders,
+        config.supportsNestedToolResultMedia,
+        req.signal,
+        { isVertex: false, authStrategy: config.authStrategy },
+      ))
     }
-    if (apiFormat === 'openai_chat') {
-      return finalizeKeyResult(await handleOpenaiChat(body, upstreamBaseUrl, effectiveApiKey, config.authStrategy === 'api_key', isStream, networkSettings, traceContext, requestOptions, upstreamHeaders))
+    if (apiFormat === 'bedrock_converse') {
+      return finalizeKeyResult(await handleBedrockConverse(
+        body,
+        upstreamBaseUrl,
+        effectiveApiKey,
+        config.authStrategy === 'api_key',
+        isStream,
+        networkSettings,
+        traceContext,
+        requestOptions,
+        upstreamHeaders,
+        config.supportsNestedToolResultMedia,
+        req.signal,
+      ))
     }
-    return finalizeKeyResult(await handleOpenaiResponses(body, upstreamBaseUrl, effectiveApiKey, config.authStrategy === 'api_key', isStream, networkSettings, traceContext, promptCacheKey, requestOptions, upstreamHeaders))
+    if (apiFormat === 'openai_chat' || apiFormat === 'azure_openai') {
+      return finalizeKeyResult(await handleOpenaiChat(
+        body,
+        upstreamBaseUrl,
+        effectiveApiKey,
+        config.authStrategy === 'api_key',
+        isStream,
+        networkSettings,
+        traceContext,
+        requestOptions,
+        upstreamHeaders,
+        undefined,
+        new Set(),
+        req.signal,
+        { forceAzure: apiFormat === 'azure_openai', authStrategy: config.authStrategy },
+      ))
+    }
+    return finalizeKeyResult(await handleOpenaiResponses(
+      body,
+      upstreamBaseUrl,
+      effectiveApiKey,
+      config.authStrategy === 'api_key',
+      isStream,
+      networkSettings,
+      traceContext,
+      promptCacheKey,
+      requestOptions,
+      upstreamHeaders,
+      req.signal,
+      config.authStrategy,
+    ))
   } catch (err) {
     if (traceContext && !wasTraceErrorRecorded(err) && !recordedTraceErrorContexts.has(traceContext)) {
       void recordProxyTrace({
@@ -387,6 +621,9 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
         startedAtMs: Date.now(),
         error: err,
       }).catch(() => {})
+    }
+    if (req.signal.aborted) {
+      return new Response(null, { status: CLIENT_CLOSED_REQUEST_STATUS })
     }
     console.error('[Proxy] Upstream request failed:', err)
     const policyError = getOpenAIPolicyError(err)
@@ -578,6 +815,7 @@ async function handleAnthropicCompatible(
   traceContext: ProxyTraceContext | null,
   upstreamHeaders: Record<string, string> = {},
   hoistNestedMedia = true,
+  downstreamSignal?: AbortSignal,
 ): Promise<Response> {
   // The media hoist is a compatibility rewrite for endpoints that drop media
   // nested in tool_result. A native Messages endpoint accepts it unchanged, so it
@@ -654,11 +892,11 @@ async function handleAnthropicCompatible(
     recordedTraceErrorContexts.add(traceContext)
   }
 
-  let upstream: Response
+  let upstreamLease: UpstreamFetchLease
   try {
     const initialRequest = transformed
     const serialized = JSON.stringify(initialRequest)
-    upstream = await fetchUpstreamWithTimeout(url, {
+    upstreamLease = await fetchUpstreamWithTimeout(url, {
       method: 'POST',
       headers,
       body: serialized,
@@ -673,9 +911,12 @@ async function handleAnthropicCompatible(
       const beta = sentHeaders.get('anthropic-beta')
       if (beta) traceHeaders['anthropic-beta'] = beta
       else delete traceHeaders['anthropic-beta']
-    })
+    }, downstreamSignal)
   } catch (err) {
     recordTraceError(err)
+    if (downstreamSignal?.aborted) {
+      return new Response(null, { status: CLIENT_CLOSED_REQUEST_STATUS })
+    }
     console.error('[Proxy] Upstream anthropic request failed:', err)
     return Response.json(
       {
@@ -688,6 +929,7 @@ async function handleAnthropicCompatible(
       { status: 502 },
     )
   }
+  const upstream = upstreamLease.response
 
   try {
     if (!upstream.ok) {
@@ -697,6 +939,7 @@ async function handleAnthropicCompatible(
       // the pending trace and surfaces to the caller's unified error handling
       // (structured 502) like any other upstream failure.
       const errBody = await upstream.arrayBuffer()
+      upstreamLease.dispose()
       const responseHeaders = stripHopByHopHeaders(upstream.headers)
       if (upstream.status === 401 && authStrategy === 'api_key') {
         try {
@@ -732,6 +975,7 @@ async function handleAnthropicCompatible(
 
     if (isStream) {
       if (!upstream.body) {
+        upstreamLease.dispose()
         if (traceContext) {
           recordProxyTraceInBackground({
             callId: traceCallId,
@@ -756,7 +1000,11 @@ async function handleAnthropicCompatible(
       responseHeaders.set('Content-Type', 'text/event-stream')
       responseHeaders.set('Cache-Control', 'no-cache')
       responseHeaders.set('Connection', 'keep-alive')
-      const anthropicStream = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs)
+      const anthropicStream = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs, {
+        downstreamSignal,
+        onAbortUpstream: upstreamLease.abortUpstream,
+        onCleanup: upstreamLease.dispose,
+      })
       const tracedStream = traceContext
         ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
             await recordProxyTrace({
@@ -774,7 +1022,7 @@ async function handleAnthropicCompatible(
               responseHeaders: upstream.headers,
               ...(error ? { error } : {}),
             })
-          }, upstream.headers.get('content-encoding') ?? undefined)
+          }, upstream.headers.get('content-encoding') ?? undefined, downstreamSignal)
         : anthropicStream
       return new Response(tracedStream, {
         status: 200,
@@ -785,6 +1033,7 @@ async function handleAnthropicCompatible(
     // Byte-for-byte passthrough: re-serializing the body would invalidate
     // Content-Length/ETag entity headers from the upstream.
     const responseBody = await upstream.arrayBuffer()
+    upstreamLease.dispose()
     if (traceContext) {
       recordProxyTraceInBackground({
         callId: traceCallId,
@@ -805,6 +1054,7 @@ async function handleAnthropicCompatible(
       headers: stripHopByHopHeaders(upstream.headers),
     })
   } catch (err) {
+    upstreamLease.dispose()
     // A body read failure closes the pending trace with the original call id
     // (so no trace stays pending and no second trace is created), then
     // rethrows so the caller returns the same structured 502 as any other
@@ -826,10 +1076,17 @@ async function handleOpenaiChat(
   upstreamHeaders: Record<string, string> = {},
   imageContentModeOverride?: OpenAIChatImageContentMode,
   rejectedReasoningFields: ReadonlySet<OpenAIChatReasoningField> = new Set(),
+  downstreamSignal?: AbortSignal,
+  options?: { forceAzure?: boolean; authStrategy?: ProviderAuthStrategy },
 ): Promise<Response> {
+  const forceAzure = options?.forceAzure === true
+  const protocol = forceAzure ? 'azure_openai' : 'openai_chat'
   const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
-  const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
-  const url = buildOpenaiEndpoint(baseUrl, 'chat/completions')
+  const reasoningProfile = resolveModelReasoningProfile(body.model, protocol)
+  const url = buildOpenaiEndpoint(baseUrl, 'chat/completions', {
+    modelId: body.model,
+    forceAzure,
+  })
   const imageContentMode = imageContentModeOverride ?? getOpenAIChatImageContentMode(url, body.model)
   const unsupportedReasoningFields = new Set([
     ...getOpenAIChatUnsupportedReasoningFields(url, body.model),
@@ -837,21 +1094,27 @@ async function handleOpenaiChat(
   ])
   let transformed = anthropicToOpenaiChat(body, {
     ...requestOptions,
+    protocol,
     roundTripReasoningContent: knownDeepSeekHost || reasoningProfile?.family === 'deepseek-v4',
     passThinkingToggle: knownDeepSeekHost && !unsupportedReasoningFields.has('thinking'),
     passReasoningEffort: !unsupportedReasoningFields.has('reasoning_effort'),
     imageContentMode,
   })
   if (traceContext) {
-    traceContext.protocolTrace = new ProtocolTraceObserver('openai_chat', transformed,
-      resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_chat' }).outputBudget)
+    traceContext.protocolTrace = new ProtocolTraceObserver(protocol, transformed,
+      resolveRequestCompatibility(body, { ...requestOptions, protocol }).outputBudget)
   }
-  // Preset-declared headers first: `Authorization` is applied last so a preset can
+  // Preset-declared headers first: credentials are applied last so a preset can
   // never shadow the credential, and the resolver already drops framing headers.
   const upstreamRequestHeaders: Record<string, string> = {}
   applyUpstreamHeaders(upstreamRequestHeaders, upstreamHeaders)
   upstreamRequestHeaders['Content-Type'] = 'application/json'
-  upstreamRequestHeaders.Authorization = `Bearer ${apiKey}`
+  Object.assign(upstreamRequestHeaders, buildOpenaiAuthHeaders({
+    url,
+    apiKey,
+    authStrategy: options?.authStrategy,
+    forceAzure,
+  }))
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
@@ -866,18 +1129,18 @@ async function handleOpenaiChat(
       })
     : undefined
 
-  let upstream: Response
+  let upstreamLease: UpstreamFetchLease
   try {
     const initialRequest = transformed
     const serialized = JSON.stringify(initialRequest)
-    upstream = await fetchUpstreamWithTimeout(url, {
+    upstreamLease = await fetchUpstreamWithTimeout(url, {
       method: 'POST',
       headers: upstreamRequestHeaders,
       body: serialized,
       ...proxyOptions,
     }, networkSettings.aiRequestTimeoutMs, isStream, sentBody => {
       transformed = sentBody === serialized ? initialRequest : JSON.parse(sentBody)
-    })
+    }, downstreamSignal)
   } catch (err) {
     if (traceContext) {
       recordProxyTraceInBackground({
@@ -895,10 +1158,12 @@ async function handleOpenaiChat(
     }
     throw err
   }
+  const upstream = upstreamLease.response
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
-    if (imageContentMode === 'vision' && isOpenAIChatImageRejection(upstream.status, errText, transformed)) {
+    upstreamLease.dispose()
+    if (!downstreamSignal?.aborted && imageContentMode === 'vision' && isOpenAIChatImageRejection(upstream.status, errText, transformed)) {
       // The upstream refused the request before generating anything, so the
       // client has seen no output and resending is safe. The model is only
       // remembered once the same request succeeds without images, so an
@@ -920,7 +1185,7 @@ async function handleOpenaiChat(
       }
       const resent = await handleOpenaiChat(
         body, baseUrl, apiKey, isSavedApiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders, 'text_only',
-        unsupportedReasoningFields,
+        unsupportedReasoningFields, downstreamSignal, options,
       )
       if (resent.ok) {
         rememberOpenAIChatTextOnlyModel(url, body.model)
@@ -934,7 +1199,7 @@ async function handleOpenaiChat(
       return resent
     }
     const rejectedField = findOpenAIChatReasoningFieldRejection(upstream.status, errText, transformed)
-    if (rejectedField && !unsupportedReasoningFields.has(rejectedField)) {
+    if (!downstreamSignal?.aborted && rejectedField && !unsupportedReasoningFields.has(rejectedField)) {
       // Same contract as the image fallback: the upstream refused the request
       // before generating anything, and the field is only remembered once the
       // resend without it succeeds.
@@ -955,7 +1220,7 @@ async function handleOpenaiChat(
       }
       const resent = await handleOpenaiChat(
         body, baseUrl, apiKey, isSavedApiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders,
-        imageContentMode, new Set([...unsupportedReasoningFields, rejectedField]),
+        imageContentMode, new Set([...unsupportedReasoningFields, rejectedField]), downstreamSignal, options,
       )
       if (resent.ok) {
         rememberOpenAIChatUnsupportedReasoningField(url, body.model, rejectedField)
@@ -1011,6 +1276,7 @@ async function handleOpenaiChat(
 
   if (isStream) {
     if (!upstream.body) {
+      upstreamLease.dispose()
       if (traceContext) {
         recordProxyTraceInBackground({
           callId: traceCallId,
@@ -1029,9 +1295,13 @@ async function handleOpenaiChat(
         { status: 502 },
       )
     }
-    const upstreamBody = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs)
+    const upstreamBody = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs, {
+      downstreamSignal,
+      onAbortUpstream: upstreamLease.abortUpstream,
+      onCleanup: upstreamLease.dispose,
+    })
     const observedBody = traceContext?.protocolTrace
-      ? observeProtocolStream(upstreamBody, traceContext.protocolTrace) : upstreamBody
+      ? observeProtocolStream(upstreamBody, traceContext.protocolTrace, downstreamSignal) : upstreamBody
     const anthropicStream = openaiChatStreamToAnthropic(observedBody, body.model)
     const tracedStream = traceContext
       ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
@@ -1050,7 +1320,7 @@ async function handleOpenaiChat(
             responseHeaders: upstream.headers,
             ...(error ? { error } : {}),
           })
-        })
+        }, undefined, downstreamSignal)
       : anthropicStream
     return new Response(tracedStream, {
       status: 200,
@@ -1063,7 +1333,28 @@ async function handleOpenaiChat(
   }
 
   // Non-streaming
-  const responseBody = await upstream.json()
+  let responseBody: any
+  try {
+    responseBody = await upstream.json()
+  } catch (err) {
+    if (traceContext) {
+      recordProxyTraceInBackground({
+        callId: traceCallId,
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: upstreamRequestHeaders,
+        startedAt,
+        startedAtMs,
+        error: err,
+      })
+      markTraceErrorRecorded(err)
+    }
+    throw err
+  } finally {
+    upstreamLease.dispose()
+  }
   const policyError = getOpenAIPolicyError(responseBody)
   const anthropicResponse = policyError
     ? { type: 'error', error: { type: 'permission_error', ...policyError } }
@@ -1105,19 +1396,25 @@ async function handleOpenaiResponses(
   promptCacheKey?: string,
   requestOptions: RequestCompatibilityOptions = {},
   upstreamHeaders: Record<string, string> = {},
+  downstreamSignal?: AbortSignal,
+  authStrategy?: ProviderAuthStrategy,
 ): Promise<Response> {
   let transformed = anthropicToOpenaiResponses(body, { ...requestOptions, cacheKey: promptCacheKey })
   if (traceContext) {
     traceContext.protocolTrace = new ProtocolTraceObserver('openai_responses', transformed,
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_responses' }).outputBudget)
   }
-  const url = buildOpenaiEndpoint(baseUrl, 'responses')
-  // Preset-declared headers first: `Authorization` is applied last so a preset can
+  const url = buildOpenaiEndpoint(baseUrl, 'responses', { modelId: body.model })
+  // Preset-declared headers first: credentials are applied last so a preset can
   // never shadow the credential, and the resolver already drops framing headers.
   const upstreamRequestHeaders: Record<string, string> = {}
   applyUpstreamHeaders(upstreamRequestHeaders, upstreamHeaders)
   upstreamRequestHeaders['Content-Type'] = 'application/json'
-  upstreamRequestHeaders.Authorization = `Bearer ${apiKey}`
+  Object.assign(upstreamRequestHeaders, buildOpenaiAuthHeaders({
+    url,
+    apiKey,
+    authStrategy,
+  }))
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
@@ -1132,18 +1429,18 @@ async function handleOpenaiResponses(
       })
     : undefined
 
-  let upstream: Response
+  let upstreamLease: UpstreamFetchLease
   try {
     const initialRequest = transformed
     const serialized = JSON.stringify(initialRequest)
-    upstream = await fetchUpstreamWithTimeout(url, {
+    upstreamLease = await fetchUpstreamWithTimeout(url, {
       method: 'POST',
       headers: upstreamRequestHeaders,
       body: serialized,
       ...proxyOptions,
     }, networkSettings.aiRequestTimeoutMs, isStream, sentBody => {
       transformed = sentBody === serialized ? initialRequest : JSON.parse(sentBody)
-    })
+    }, downstreamSignal)
   } catch (err) {
     if (traceContext) {
       recordProxyTraceInBackground({
@@ -1161,9 +1458,11 @@ async function handleOpenaiResponses(
     }
     throw err
   }
+  const upstream = upstreamLease.response
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
+    upstreamLease.dispose()
     let policyError = null
     let invalidProviderKey = false
     try {
@@ -1207,6 +1506,7 @@ async function handleOpenaiResponses(
 
   if (isStream) {
     if (!upstream.body) {
+      upstreamLease.dispose()
       if (traceContext) {
         recordProxyTraceInBackground({
           callId: traceCallId,
@@ -1225,9 +1525,13 @@ async function handleOpenaiResponses(
         { status: 502 },
       )
     }
-    const upstreamBody = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs)
+    const upstreamBody = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs, {
+      downstreamSignal,
+      onAbortUpstream: upstreamLease.abortUpstream,
+      onCleanup: upstreamLease.dispose,
+    })
     const observedBody = traceContext?.protocolTrace
-      ? observeProtocolStream(upstreamBody, traceContext.protocolTrace) : upstreamBody
+      ? observeProtocolStream(upstreamBody, traceContext.protocolTrace, downstreamSignal) : upstreamBody
     const anthropicStream = openaiResponsesStreamToAnthropic(observedBody, body.model)
     const tracedStream = traceContext
       ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
@@ -1246,7 +1550,7 @@ async function handleOpenaiResponses(
             responseHeaders: upstream.headers,
             ...(error ? { error } : {}),
           })
-        })
+        }, undefined, downstreamSignal)
       : anthropicStream
     return new Response(tracedStream, {
       status: 200,
@@ -1259,7 +1563,28 @@ async function handleOpenaiResponses(
   }
 
   // Non-streaming
-  const responseBody = await upstream.json()
+  let responseBody: any
+  try {
+    responseBody = await upstream.json()
+  } catch (err) {
+    if (traceContext) {
+      recordProxyTraceInBackground({
+        callId: traceCallId,
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: upstreamRequestHeaders,
+        startedAt,
+        startedAtMs,
+        error: err,
+      })
+      markTraceErrorRecorded(err)
+    }
+    throw err
+  } finally {
+    upstreamLease.dispose()
+  }
   const policyError = getOpenAIPolicyError(responseBody)
   const anthropicResponse = policyError
     ? { type: 'error', error: { type: 'permission_error', ...policyError } }
@@ -1284,9 +1609,10 @@ async function handleOpenaiResponses(
 }
 
 /**
- * Google `generateContent`, as OpenCode Go serves its Gemini models. A response
- * Gemini splits across requests is followed here by resending the same body
- * with the continuation token, so the client still receives one message.
+ * Google `generateContent` proxy handler (standalone Gemini providers and
+ * multi-protocol gateways). A response Gemini splits across requests is
+ * followed here by resending the same body with the continuation token, so the
+ * client still receives one message.
  */
 async function handleGemini(
   body: AnthropicRequest,
@@ -1298,24 +1624,46 @@ async function handleGemini(
   traceContext: ProxyTraceContext | null,
   requestOptions: RequestCompatibilityOptions = {},
   upstreamHeaders: Record<string, string> = {},
+  supportsNestedToolResultMedia = true,
+  downstreamSignal?: AbortSignal,
+  options?: { isVertex?: boolean; authStrategy?: ProviderAuthStrategy },
 ): Promise<Response> {
-  const transformed = anthropicToGemini(body, requestOptions)
-  const model = encodeURIComponent(body.model)
-  const url = isStream
-    ? `${baseUrl}/models/${model}:streamGenerateContent?alt=sse`
-    : `${baseUrl}/models/${model}:generateContent`
-  // Preset-declared headers first, so the credential always wins over them.
+  const isVertex = options?.isVertex === true || isVertexEndpointUrl(baseUrl)
+  const protocol = options?.isVertex ? 'google_vertex' : 'gemini'
+  const transformed = anthropicToGemini(body, {
+    ...requestOptions,
+    supportsNestedToolResultMedia,
+    isVertex,
+  })
+  if (traceContext) {
+    traceContext.protocolTrace = new ProtocolTraceObserver(
+      protocol,
+      transformed,
+      resolveRequestCompatibility(body, { ...requestOptions, protocol }).outputBudget,
+    )
+  }
+  const url = buildGeminiEndpoint(baseUrl, body.model, isStream, { isVertex })
+  // Preset-declared headers first, so credentials and service-tier headers win.
   const upstreamRequestHeaders: Record<string, string> = {}
   applyUpstreamHeaders(upstreamRequestHeaders, upstreamHeaders)
-  upstreamRequestHeaders['Content-Type'] = 'application/json'
-  upstreamRequestHeaders['x-goog-api-key'] = apiKey
+  applyUpstreamHeaders(upstreamRequestHeaders, { 'Content-Type': 'application/json' })
+  if (isVertex) {
+    applyUpstreamHeaders(
+      upstreamRequestHeaders,
+      buildVertexServiceTierHeaders(requestOptions.requestCompatibility?.serviceTier),
+    )
+    const authHeaders = await resolveVertexAuthHeaders(apiKey, options?.authStrategy, baseUrl)
+    applyUpstreamHeaders(upstreamRequestHeaders, authHeaders)
+  } else if (apiKey) {
+    applyUpstreamHeaders(upstreamRequestHeaders, { 'x-goog-api-key': apiKey })
+  }
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
   const send = (request: GeminiRequest) => fetchUpstreamWithTimeout(url, {
     method: 'POST',
     headers: upstreamRequestHeaders,
     body: JSON.stringify(request),
     ...proxyOptions,
-  }, networkSettings.aiRequestTimeoutMs, isStream)
+  }, networkSettings.aiRequestTimeoutMs, isStream, undefined, downstreamSignal)
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
   const traceCallId = traceContext
@@ -1343,17 +1691,19 @@ async function handleGemini(
     })
   }
 
-  let upstream: Response
+  let upstreamLease: UpstreamFetchLease
   try {
-    upstream = await send(transformed)
+    upstreamLease = await send(transformed)
   } catch (err) {
     trace({ error: err })
     if (traceContext) markTraceErrorRecorded(err)
     throw err
   }
+  const upstream = upstreamLease.response
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
+    upstreamLease.dispose()
     let invalidProviderKey = false
     if (isSavedApiKey && upstream.status === 401 && errText.length <= MAX_CREDENTIAL_ERROR_BYTES) {
       try {
@@ -1364,7 +1714,7 @@ async function handleGemini(
     }
     const errorBody = {
       type: 'error',
-      error: { type: 'api_error', message: invalidProviderKey ? formatUpstreamErrorMessage(upstream.status, errText) : `Upstream returned HTTP ${upstream.status}: ${errText.slice(0, 500)}` },
+      error: { type: 'api_error', message: formatUpstreamErrorMessage(upstream.status, errText) },
     }
     trace({
       responseStatus: upstream.status,
@@ -1379,10 +1729,11 @@ async function handleGemini(
   }
 
   // Only the first request is traced; continuations carry the same body plus a token.
-  const resend = async (continuationToken: string): Promise<Response> => {
-    const response = await send({ ...transformed, continuationToken })
-    if (response.ok) return response
-    const errText = await response.text().catch(() => '')
+  const resend = async (continuationToken: string): Promise<UpstreamFetchLease> => {
+    const lease = await send({ ...transformed, continuationToken })
+    if (lease.response.ok) return lease
+    const errText = await lease.response.text().catch(() => '')
+    lease.dispose()
     let message: string | undefined
     try {
       message = geminiErrorMessage(JSON.parse(errText))
@@ -1390,24 +1741,37 @@ async function handleGemini(
       // An unstructured failure keeps its raw text below.
     }
     throw new GeminiUpstreamError(
-      `Gemini continuation returned HTTP ${response.status}: ${(message ?? errText).slice(0, 500)}`,
-      response.status,
+      `Gemini continuation returned HTTP ${lease.response.status}: ${(message ?? errText).slice(0, 500)}`,
+      lease.response.status,
     )
   }
 
   if (isStream) {
     if (!upstream.body) {
+      upstreamLease.dispose()
       trace({ error: new Error('Upstream returned no body for stream') })
       return Response.json(
         { type: 'error', error: { type: 'api_error', message: 'Upstream returned no body for stream' } },
         { status: 502 },
       )
     }
-    const idle = (stream: ReadableStream<Uint8Array>) => withStreamIdleTimeout(stream, networkSettings.aiRequestTimeoutMs)
-    const anthropicStream = geminiStreamToAnthropic(idle(upstream.body), body.model, async (token) => {
-      const response = await resend(token)
-      if (!response.body) throw new GeminiUpstreamError('Gemini continuation returned no body for stream')
-      return idle(response.body)
+    const idle = (lease: UpstreamFetchLease) =>
+      withStreamIdleTimeout(lease.response.body!, networkSettings.aiRequestTimeoutMs, {
+        downstreamSignal,
+        onAbortUpstream: lease.abortUpstream,
+        onCleanup: lease.dispose,
+      })
+    const initialBody = idle(upstreamLease)
+    const observedBody = traceContext?.protocolTrace
+      ? observeProtocolStream(initialBody, traceContext.protocolTrace, downstreamSignal)
+      : initialBody
+    const anthropicStream = geminiStreamToAnthropic(observedBody, body.model, async (token) => {
+      const lease = await resend(token)
+      if (!lease.response.body) {
+        lease.dispose()
+        throw new GeminiUpstreamError('Gemini continuation returned no body for stream')
+      }
+      return idle(lease)
     })
     const tracedStream = traceContext
       ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
@@ -1426,7 +1790,7 @@ async function handleGemini(
             responseHeaders: upstream.headers,
             ...(error ? { error } : {}),
           })
-        })
+        }, undefined, downstreamSignal)
       : anthropicStream
     return new Response(tracedStream, {
       status: 200,
@@ -1439,14 +1803,30 @@ async function handleGemini(
   }
 
   // Non-streaming
-  const responseBody = await upstream.json()
+  let responseBody: any
+  try {
+    responseBody = await upstream.json()
+  } catch (err) {
+    trace({ error: err })
+    if (traceContext) markTraceErrorRecorded(err)
+    throw err
+  } finally {
+    upstreamLease.dispose()
+  }
   let anthropicResponse: unknown
   let status = 200
   try {
     anthropicResponse = await geminiResponseToAnthropic(
       responseBody,
       body.model,
-      async token => (await resend(token)).json(),
+      async token => {
+        const lease = await resend(token)
+        try {
+          return await lease.response.json()
+        } finally {
+          lease.dispose()
+        }
+      },
     )
   } catch (err) {
     if (!(err instanceof GeminiUpstreamError)) throw err
@@ -1460,6 +1840,432 @@ async function handleGemini(
     responseHeaders: upstream.headers,
   })
   return Response.json(anthropicResponse, { status })
+}
+
+/**
+ * Google Vertex AI Anthropic (`rawPredict` / `streamRawPredict`) proxy handler.
+ *
+ * Follows `@ai-sdk/google-vertex/anthropic`: strips `model` from the Messages
+ * payload, injects `anthropic_version: 'vertex-2023-10-16'`, authenticates via
+ * GCP Vertex OAuth2 / Service Account JSON / ADC, and forwards Anthropic SSE /
+ * JSON responses natively.
+ */
+async function handleVertexAnthropic(
+  body: AnthropicRequest,
+  baseUrl: string,
+  apiKey: string,
+  authStrategy: ProviderAuthStrategy,
+  incomingHeaders: Headers,
+  isStream: boolean,
+  networkSettings: NetworkSettings,
+  traceContext: ProxyTraceContext | null,
+  requestOptions: RequestCompatibilityOptions = {},
+  upstreamHeaders: Record<string, string> = {},
+  supportsNestedToolResultMedia = true,
+  downstreamSignal?: AbortSignal,
+): Promise<Response> {
+  const prepared = supportsNestedToolResultMedia === false
+    ? hoistToolResultMediaForCompatibility(body)
+    : body
+  const { model: _model, ...rest } = prepared
+  const transformed: Record<string, unknown> = {
+    ...rest,
+    anthropic_version: 'vertex-2023-10-16',
+  }
+  const url = buildVertexAnthropicEndpoint(baseUrl, body.model, isStream)
+  const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
+
+  const headers: Record<string, string> = {}
+  const deny = hopByHopDenySet(incomingHeaders)
+  for (const [name, value] of incomingHeaders.entries()) {
+    const lower = name.toLowerCase()
+    if (deny.has(lower) || isInternalClientHeader(lower, value)) continue
+    if (lower === 'host' || lower === 'content-type' || lower === 'content-length') continue
+    if (
+      lower === 'x-api-key' ||
+      lower === 'authorization' ||
+      lower === 'anthropic-version' ||
+      lower === 'x-goog-api-key' ||
+      lower === 'x-vertex-ai-llm-request-type' ||
+      lower === 'x-vertex-ai-llm-shared-request-type'
+    ) continue
+    if (value) headers[name] = value
+  }
+  applyUpstreamHeaders(headers, upstreamHeaders)
+  applyUpstreamHeaders(headers, { 'Content-Type': 'application/json' })
+  applyUpstreamHeaders(
+    headers,
+    buildVertexServiceTierHeaders(requestOptions.requestCompatibility?.serviceTier),
+  )
+  applyUpstreamHeaders(headers, await resolveVertexAuthHeaders(apiKey, authStrategy, baseUrl))
+
+  const traceHeaders = Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => {
+      const lower = name.toLowerCase()
+      return [
+        name,
+        lower === 'content-type' ||
+        lower === 'anthropic-version' ||
+        lower === 'anthropic-beta' ||
+        lower === 'x-vertex-ai-llm-request-type' ||
+        lower === 'x-vertex-ai-llm-shared-request-type'
+          ? value
+          : '[redacted]',
+      ]
+    }),
+  )
+
+  const startedAtMs = Date.now()
+  const startedAt = new Date(startedAtMs).toISOString()
+  const traceCallId = traceContext
+    ? startProxyTraceCall({
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: traceHeaders,
+        startedAt,
+      })
+    : undefined
+
+  const recordTraceError = (err: unknown): void => {
+    if (!traceContext) return
+    recordProxyTraceInBackground({
+      callId: traceCallId,
+      context: traceContext,
+      model: body.model,
+      upstreamUrl: url,
+      upstreamRequest: transformed,
+      requestHeaders: traceHeaders,
+      startedAt,
+      startedAtMs,
+      error: err,
+    })
+    markTraceErrorRecorded(err)
+    recordedTraceErrorContexts.add(traceContext)
+  }
+
+  let upstreamLease: UpstreamFetchLease
+  try {
+    upstreamLease = await fetchUpstreamWithTimeout(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(transformed),
+      decompress: false,
+      ...proxyOptions,
+    }, networkSettings.aiRequestTimeoutMs, isStream, undefined, downstreamSignal)
+  } catch (err) {
+    recordTraceError(err)
+    throw err
+  }
+  const upstream = upstreamLease.response
+
+  try {
+    if (!upstream.ok) {
+      const errBody = await upstream.arrayBuffer()
+      upstreamLease.dispose()
+      const responseHeaders = stripHopByHopHeaders(upstream.headers)
+      if (traceContext) {
+        recordProxyTraceInBackground({
+          callId: traceCallId,
+          context: traceContext,
+          model: body.model,
+          upstreamUrl: url,
+          upstreamRequest: transformed,
+          requestHeaders: traceHeaders,
+          startedAt,
+          startedAtMs,
+          responseStatus: upstream.status,
+          upstreamResponseBody: decodeTraceResponseBody(errBody, upstream.headers),
+          responseHeaders: upstream.headers,
+        })
+      }
+      return new Response(errBody, {
+        status: upstream.status,
+        headers: responseHeaders,
+      })
+    }
+
+    if (isStream) {
+      if (!upstream.body) {
+        upstreamLease.dispose()
+        if (traceContext) {
+          recordProxyTraceInBackground({
+            callId: traceCallId,
+            context: traceContext,
+            model: body.model,
+            upstreamUrl: url,
+            upstreamRequest: transformed,
+            requestHeaders: traceHeaders,
+            startedAt,
+            startedAtMs,
+            error: new Error('Upstream returned no body for stream'),
+          })
+        }
+        return Response.json(
+          { type: 'error', error: { type: 'api_error', message: 'Upstream returned no body for stream' } },
+          { status: 502 },
+        )
+      }
+      const responseHeaders = stripHopByHopHeaders(upstream.headers)
+      responseHeaders.set('Content-Type', 'text/event-stream')
+      responseHeaders.set('Cache-Control', 'no-cache')
+      responseHeaders.set('Connection', 'keep-alive')
+      const anthropicStream = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs, {
+        downstreamSignal,
+        onAbortUpstream: upstreamLease.abortUpstream,
+        onCleanup: upstreamLease.dispose,
+      })
+      const tracedStream = traceContext
+        ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
+            await recordProxyTrace({
+              callId: traceCallId,
+              context: traceContext,
+              model: body.model,
+              upstreamUrl: url,
+              upstreamRequest: transformed,
+              requestHeaders: traceHeaders,
+              startedAt,
+              startedAtMs,
+              responseStatus: 200,
+              responseBodySnapshot: bodySnapshot,
+              protocolTraceEnd,
+              responseHeaders: upstream.headers,
+              ...(error ? { error } : {}),
+            })
+          }, upstream.headers.get('content-encoding') ?? undefined, downstreamSignal)
+        : anthropicStream
+      return new Response(tracedStream, {
+        status: 200,
+        headers: responseHeaders,
+      })
+    }
+
+    const responseBody = await upstream.arrayBuffer()
+    upstreamLease.dispose()
+    if (traceContext) {
+      recordProxyTraceInBackground({
+        callId: traceCallId,
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: traceHeaders,
+        startedAt,
+        startedAtMs,
+        responseStatus: upstream.status,
+        upstreamResponseBody: decodeTraceResponseBody(responseBody, upstream.headers),
+        responseHeaders: upstream.headers,
+      })
+    }
+    return new Response(responseBody, {
+      status: upstream.status,
+      headers: stripHopByHopHeaders(upstream.headers),
+    })
+  } catch (err) {
+    upstreamLease.dispose()
+    recordTraceError(err)
+    throw err
+  }
+}
+
+/**
+ * AWS Bedrock Runtime Converse / ConverseStream proxy handler.
+ *
+ * Authenticates with AWS Bedrock API Key (Bearer token) or AWS SigV4 signing
+ * (`@smithy/signature-v4`), transforms Anthropic Messages to Bedrock Converse
+ * JSON, and decodes AWS binary EventStream (`application/vnd.amazon.eventstream`)
+ * or JSON responses back to Anthropic Messages.
+ */
+async function handleBedrockConverse(
+  body: AnthropicRequest,
+  baseUrl: string,
+  apiKey: string,
+  isSavedApiKey: boolean,
+  isStream: boolean,
+  networkSettings: NetworkSettings,
+  traceContext: ProxyTraceContext | null,
+  requestOptions: RequestCompatibilityOptions = {},
+  upstreamHeaders: Record<string, string> = {},
+  supportsNestedToolResultMedia = true,
+  downstreamSignal?: AbortSignal,
+): Promise<Response> {
+  const transformed = anthropicToBedrockConverse(body, {
+    ...requestOptions,
+    supportsNestedToolResultMedia,
+  })
+  if (traceContext) {
+    traceContext.protocolTrace = new ProtocolTraceObserver(
+      'bedrock_converse',
+      transformed,
+      resolveRequestCompatibility(body, { ...requestOptions, protocol: 'bedrock_converse' }).outputBudget,
+    )
+  }
+  const url = buildBedrockConverseEndpoint(baseUrl, body.model, isStream)
+  const serialized = JSON.stringify(transformed)
+  const baseHeaders: Record<string, string> = {}
+  applyUpstreamHeaders(baseHeaders, upstreamHeaders)
+  baseHeaders['Content-Type'] = 'application/json'
+  if (isStream) baseHeaders.Accept = 'application/vnd.amazon.eventstream'
+  const upstreamRequestHeaders = await buildBedrockRequestHeaders({
+    url,
+    method: 'POST',
+    body: serialized,
+    rawCredential: apiKey,
+    baseHeaders,
+  })
+  const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
+  const startedAtMs = Date.now()
+  const startedAt = new Date(startedAtMs).toISOString()
+  const traceCallId = traceContext
+    ? startProxyTraceCall({
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: upstreamRequestHeaders,
+        startedAt,
+      })
+    : undefined
+  const trace = (fields: Partial<RecordProxyTraceInput>) => {
+    if (!traceContext) return
+    recordProxyTraceInBackground({
+      callId: traceCallId,
+      context: traceContext,
+      model: body.model,
+      upstreamUrl: url,
+      upstreamRequest: transformed,
+      requestHeaders: upstreamRequestHeaders,
+      startedAt,
+      startedAtMs,
+      ...fields,
+    })
+  }
+
+  let upstreamLease: UpstreamFetchLease
+  try {
+    upstreamLease = await fetchUpstreamWithTimeout(url, {
+      method: 'POST',
+      headers: upstreamRequestHeaders,
+      body: serialized,
+      ...proxyOptions,
+    }, networkSettings.aiRequestTimeoutMs, isStream, undefined, downstreamSignal)
+  } catch (err) {
+    trace({ error: err })
+    if (traceContext) markTraceErrorRecorded(err)
+    throw err
+  }
+  const upstream = upstreamLease.response
+
+  if (!upstream.ok) {
+    const errText = await upstream.text().catch(() => '')
+    upstreamLease.dispose()
+    let invalidProviderKey = false
+    if (isSavedApiKey && (upstream.status === 401 || upstream.status === 403) && errText.length <= MAX_CREDENTIAL_ERROR_BYTES) {
+      try {
+        invalidProviderKey = isInvalidSavedProviderKey(upstream.status, JSON.parse(errText))
+      } catch {
+        // Keep upstream error text as-is.
+      }
+    }
+    const errorBody = {
+      type: 'error',
+      error: { type: 'api_error', message: formatUpstreamErrorMessage(upstream.status, errText) },
+    }
+    trace({
+      responseStatus: upstream.status,
+      upstreamResponseBody: errText,
+      anthropicResponseBody: errorBody,
+      responseHeaders: upstream.headers,
+    })
+    return Response.json(errorBody, {
+      status: upstream.status,
+      ...(invalidProviderKey && { headers: { [INVALID_PROVIDER_KEY_HEADER]: 'true', 'x-should-retry': 'false' } }),
+    })
+  }
+
+  const requestId = upstream.headers.get('x-amzn-requestid') ?? undefined
+
+  if (isStream) {
+    if (!upstream.body) {
+      upstreamLease.dispose()
+      trace({ error: new Error('Upstream returned no body for stream') })
+      return Response.json(
+        { type: 'error', error: { type: 'api_error', message: 'Upstream returned no body for stream' } },
+        { status: 502 },
+      )
+    }
+    const upstreamBody = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs, {
+      downstreamSignal,
+      onAbortUpstream: upstreamLease.abortUpstream,
+      onCleanup: upstreamLease.dispose,
+    })
+    const observer = traceContext?.protocolTrace
+    const observedBinary = observer
+      ? upstreamBody.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            observer.observeEvent('', {}, chunk.byteLength)
+            controller.enqueue(chunk)
+          },
+        }))
+      : upstreamBody
+    const anthropicStream = bedrockConverseStreamToAnthropic(observedBinary, body.model, {
+      requestId,
+      ...(observer
+        ? {
+            onEvent: (eventType, payload) => {
+              observer.observeEvent(eventType, payload)
+            },
+          }
+        : {}),
+    })
+    const tracedStream = traceContext
+      ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
+          await recordProxyTrace({
+            callId: traceCallId,
+            context: traceContext,
+            model: body.model,
+            upstreamUrl: url,
+            upstreamRequest: transformed,
+            requestHeaders: upstreamRequestHeaders,
+            startedAt,
+            startedAtMs,
+            responseStatus: 200,
+            responseBodySnapshot: bodySnapshot,
+            protocolTraceEnd,
+            responseHeaders: upstream.headers,
+            ...(error ? { error } : {}),
+          })
+        }, undefined, downstreamSignal)
+      : anthropicStream
+    return new Response(tracedStream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      },
+    })
+  }
+
+  let responseBody: unknown
+  try {
+    responseBody = await upstream.json()
+  } catch (err) {
+    trace({ error: err })
+    if (traceContext) markTraceErrorRecorded(err)
+    throw err
+  } finally {
+    upstreamLease.dispose()
+  }
+  const anthropicResponse = bedrockConverseResponseToAnthropic(responseBody, body.model, requestId)
+  trace({
+    responseStatus: 200,
+    upstreamResponseBody: responseBody,
+    anthropicResponseBody: anthropicResponse,
+    responseHeaders: upstream.headers,
+  })
+  return Response.json(anthropicResponse, { status: 200 })
 }
 
 function buildProxyTraceContext(
@@ -1609,6 +2415,8 @@ async function recordProxyTrace({
     }
   }
 
+  const aborted = protocolTraceEnd === 'cancelled' || isAbortLikeError(error)
+
   await traceCaptureService.recordCall({
     ...(callId ? { id: callId } : {}),
     sessionId: context.sessionId,
@@ -1636,6 +2444,7 @@ async function recordProxyTrace({
     ...(error ? { error } : {}),
     metadata: {
       phase: error ? 'upstream_fetch_failed' : 'upstream_fetch_completed',
+      ...(aborted ? { aborted: true } : {}),
       ...(observer ? {
         protocolTrace: {
           ...observer.snapshot(),
@@ -1658,6 +2467,7 @@ async function recordProxyTrace({
     metadata: {
       status: responseStatus,
       url: upstreamUrl,
+      ...(aborted ? { aborted: true } : {}),
     },
   })
 }
@@ -1666,6 +2476,7 @@ function captureTraceStream(
   stream: ReadableStream<Uint8Array>,
   onComplete: (snapshot: TraceBodySnapshot, error?: unknown, end?: Exclude<ProtocolTraceTransport, 'open'>) => Promise<void>,
   contentEncoding?: string,
+  downstreamSignal?: AbortSignal,
 ): ReadableStream<Uint8Array> {
   // The Anthropic passthrough forwards raw upstream bytes (`decompress:
   // false`), so a compressed SSE body would otherwise be stored as binary
@@ -1794,13 +2605,65 @@ function captureTraceStream(
     await decompressEnded
   }
 
+  let streamCancelled = false
+  let abortPromise: Promise<void> | null = null
+
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       reader = stream.getReader()
+      const abortFromDownstream = (): Promise<void> => {
+        if (!abortPromise) {
+          abortPromise = (async () => {
+            activelyEnded = true
+            const abortError = toAbortError(downstreamSignal?.reason, 'Stream cancelled')
+            // Defer controller.error by one microtask so Bun.serve's synchronous
+            // post-abort Response.body.cancel() can mark streamCancelled first
+            // without triggering an uncaught HTTP sink error, while direct
+            // Response.body readers without reader.cancel() still reject on the
+            // next microtask.
+            queueMicrotask(() => {
+              if (streamCancelled) return
+              try {
+                controller.error(abortError)
+              } catch {
+                // Stream may already be closed, cancelled, or errored.
+              }
+            })
+            const cancelPromise = reader?.cancel(abortError).catch(() => undefined)
+            await finishDecompressor()
+            void finalize(abortError, 'cancelled')
+            await cancelPromise
+          })()
+        }
+        return abortPromise
+      }
+      const onDownstreamAbort = () => {
+        if (streamCancelled || finalized) return
+        void abortFromDownstream()
+      }
+      if (downstreamSignal?.aborted) {
+        await abortFromDownstream()
+        try {
+          reader?.releaseLock()
+        } catch {
+          // Reader lock may already be released.
+        }
+        reader = null
+        return
+      }
+      downstreamSignal?.addEventListener('abort', onDownstreamAbort, { once: true })
       try {
-        while (true) {
+        while (!streamCancelled) {
+          if (downstreamSignal?.aborted) {
+            await abortFromDownstream()
+            return
+          }
           const { done, value } = await reader.read()
-          if (done) break
+          if (downstreamSignal?.aborted) {
+            await abortFromDownstream()
+            return
+          }
+          if (streamCancelled || done) break
           controller.enqueue(value)
           if (decompressor) {
             if (!decompressorFailed && !decompressorEnded) {
@@ -1821,23 +2684,49 @@ function captureTraceStream(
             captureDecoded(value)
           }
         }
+        if (downstreamSignal?.aborted) {
+          await abortFromDownstream()
+          return
+        }
+        if (streamCancelled) return
         controller.close()
         await finishDecompressor()
         void finalize()
       } catch (err) {
-        controller.error(err)
+        if (downstreamSignal?.aborted) {
+          await abortFromDownstream()
+          return
+        }
+        if (streamCancelled) return
+        try {
+          controller.error(err)
+        } catch {
+          // Stream may already be closed or errored.
+        }
         activelyEnded = true
         await finishDecompressor()
         void finalize(err, 'error')
       } finally {
-        reader?.releaseLock()
+        if (downstreamSignal) {
+          downstreamSignal.removeEventListener('abort', onDownstreamAbort)
+        }
+        try {
+          reader?.releaseLock()
+        } catch {
+          // Reader lock may already be released.
+        }
         reader = null
       }
     },
     async cancel(reason) {
+      streamCancelled = true
+      if (abortPromise) {
+        await abortPromise
+        return
+      }
       const error = reason instanceof Error
-        ? reason
-        : new Error(reason ? `Stream cancelled: ${String(reason)}` : 'Stream cancelled')
+        ? toAbortError(reason)
+        : new DOMException(reason ? `Stream cancelled: ${String(reason)}` : 'Stream cancelled', 'AbortError')
       activelyEnded = true
       await finishDecompressor()
       void finalize(error, 'cancelled')

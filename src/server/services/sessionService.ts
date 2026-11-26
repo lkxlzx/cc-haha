@@ -27,7 +27,7 @@ import { createInterface } from 'node:readline'
 import { ApiError } from '../middleware/errorHandler.js'
 import { sanitizePath as sanitizePortablePath } from '../../utils/sessionStoragePortable.js'
 import { migrateFileHistorySnapshot, type FileHistorySnapshot } from '../../utils/fileHistory.js'
-import { findCanonicalGitRoot } from '../../utils/git.js'
+import { findCanonicalGitRoot, findCanonicalGitRootPreservingPathIdentity } from '../../utils/git.js'
 import { calculateUSDCost, MODEL_COSTS } from '../../utils/modelCost.js'
 import {
   MODEL_CONTEXT_WINDOW_DEFAULT,
@@ -61,14 +61,21 @@ import { cleanSessionTitleSource } from '../../utils/sessionTitleText.js'
 import {
   roughTokenCountEstimationForMessage,
 } from '../../services/tokenEstimation.js'
+import type { AssistantMessage } from '../../types/message.js'
+import { SYNTHETIC_MODEL } from '../../utils/messages.js'
+import { getTokenUsage, isUsableContextUsage } from '../../utils/tokens.js'
 import { ProviderService } from './providerService.js'
+import { OPENAI_OFFICIAL_PROVIDER_ID, isOpenAIOfficialProviderId } from './openaiOfficialProvider.js'
+import { GROK_OFFICIAL_PROVIDER_ID, isGrokOfficialProviderId } from './grokOfficialProvider.js'
 import { shouldHideCommandMetadataContent } from '../../utils/commandMetadata.js'
 import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import { getSettings_DEPRECATED } from '../../utils/settings/settings.js'
+import { findExplicitProjectRoot, readProjectIdentity } from './projectIdentity.js'
 import { readSessionArchives, withSessionArchiveLock, writeSessionArchive } from '../../utils/sessionArchiveStore.js'
 import {
   extractGoalCreationTitle,
   extractTranscriptUserTitle,
+  resolveEntryMessageRole,
   resolveSessionEffortLevel,
 } from './localIndex/transcriptReducer.js'
 import type {
@@ -273,6 +280,7 @@ export type MessageEntry = {
   businessErrorCode?: string
   bodyTruncated?: boolean
   toolUseResult?: unknown
+  durationMs?: number
   timestamp: string
   model?: string
   usage?: MessageUsage
@@ -509,6 +517,7 @@ type RawEntry = {
     }
   }
   timestamp?: string
+  durationMs?: number
   version?: string
   snapshot?: {
     messageId?: string
@@ -537,6 +546,9 @@ type TranscriptContextAccumulator = {
   } | null
   estimatedTokensFromMessages: number
   estimatedTokensAfterUsage: number
+  latestUsageResponseId: string | undefined
+  unreportedOutputTokens: number
+  currentResponse: { id: string; outputTokens: number; tailTokens: number } | null
   transcriptHasMediaInput: boolean
 }
 
@@ -580,6 +592,9 @@ function createTranscriptContextAccumulator(): TranscriptContextAccumulator {
     latestUsage: null,
     estimatedTokensFromMessages: 0,
     estimatedTokensAfterUsage: 0,
+    latestUsageResponseId: undefined,
+    unreportedOutputTokens: 0,
+    currentResponse: null,
     transcriptHasMediaInput: false,
   }
 }
@@ -592,6 +607,9 @@ function accumulateTranscriptContext(
     state.latestUsage = null
     state.estimatedTokensFromMessages = 0
     state.estimatedTokensAfterUsage = 0
+    state.latestUsageResponseId = undefined
+    state.unreportedOutputTokens = 0
+    state.currentResponse = null
     state.transcriptHasMediaInput = false
   }
 
@@ -599,22 +617,45 @@ function accumulateTranscriptContext(
     state.latestModel = entry.message.model
   }
 
+  const assistant = entry.type === 'assistant' && entry.message
+    ? { ...entry, message: { ...entry.message, content: entry.message.content ?? [] } } as unknown as AssistantMessage
+    : undefined
+  const responseId = assistant?.message.model !== SYNTHETIC_MODEL
+    ? assistant?.message.id
+    : undefined
+  let tokens = 0
   if (
     entry.type === 'user' ||
     entry.type === 'assistant' ||
     entry.type === 'attachment'
   ) {
-    const tokens = roughTokenCountEstimationForMessage(entry)
+    tokens = roughTokenCountEstimationForMessage(entry)
     state.estimatedTokensFromMessages += tokens
-    state.estimatedTokensAfterUsage += tokens
     if (!state.transcriptHasMediaInput && hasMediaInput([entry])) {
       state.transcriptHasMediaInput = true
     }
   }
 
-  const usage = entry.message?.usage
+  // A streamed response has one assistant record per content block, sometimes
+  // interleaved with tool results. Keep only its counters, so later siblings
+  // neither erase earlier results nor charge the response's output twice.
+  if (responseId && state.currentResponse?.id !== responseId) {
+    state.currentResponse = { id: responseId, outputTokens: 0, tailTokens: 0 }
+  }
+  if (responseId && state.currentResponse) {
+    state.currentResponse.outputTokens += tokens
+  } else if (state.currentResponse) {
+    state.currentResponse.tailTokens += tokens
+  }
+  if (responseId && responseId === state.latestUsageResponseId) {
+    if (state.latestUsage?.outputTokens === 0) state.unreportedOutputTokens += tokens
+  } else {
+    state.estimatedTokensAfterUsage += tokens
+  }
+
+  const usage = assistant ? getTokenUsage(assistant) : undefined
   const model = entry.message?.model
-  if (!usage || typeof model !== 'string') return
+  if (!usage || typeof model !== 'string' || !isUsableContextUsage(usage)) return
 
   const inputTokens =
     typeof usage.input_tokens === 'number' ? usage.input_tokens : 0
@@ -629,15 +670,6 @@ function accumulateTranscriptContext(
       ? usage.cache_creation_input_tokens
       : 0
 
-  if (
-    inputTokens === 0 &&
-    outputTokens === 0 &&
-    cacheReadInputTokens === 0 &&
-    cacheCreationInputTokens === 0
-  ) {
-    return
-  }
-
   state.latestUsage = {
     model,
     inputTokens,
@@ -645,7 +677,11 @@ function accumulateTranscriptContext(
     cacheReadInputTokens,
     cacheCreationInputTokens,
   }
-  state.estimatedTokensAfterUsage = 0
+  state.latestUsageResponseId = responseId
+  state.estimatedTokensAfterUsage = responseId ? state.currentResponse!.tailTokens : 0
+  state.unreportedOutputTokens = outputTokens === 0
+    ? responseId ? state.currentResponse!.outputTokens : tokens
+    : 0
 }
 
 function resolveTranscriptContextUsage(
@@ -947,7 +983,8 @@ export class SessionService {
       now: this.now,
       scope: () => this.getConfigDir(),
       revision: () => this.projectHistoryRevision(),
-      mutation: () => `${this.getConfigDir()}:${getSharedSessionMutationState(this.localIndexGateway).epoch}:${readSessionArchives(this.getConfigDir()).revision}`,
+      mutation: () => `${this.getConfigDir()}:${getSharedSessionMutationState(this.localIndexGateway).epoch}:${readSessionArchives(this.getConfigDir()).revision}:${readProjectIdentity(this.getConfigDir()).revision}`,
+      identityRevision: () => readProjectIdentity(this.getConfigDir()).revision,
       load: () => this.loadProjectHistoryRows(),
       archiveIds: () => readSessionArchives(this.getConfigDir()).ids,
       hydrate: async (row, archived) => {
@@ -979,6 +1016,7 @@ export class SessionService {
       offset: options?.offset ?? 0,
       archived: options?.archived ?? false,
       archiveRevision: readSessionArchives(scope).revision,
+      projectIdentityRevision: readProjectIdentity(scope).revision,
     })
   }
 
@@ -1553,7 +1591,7 @@ export class SessionService {
       const transcriptMetadata: TranscriptMetadataSnapshot = {}
       const apply = (state: ReturnType<typeof makeState>, entry: RawEntry) => {
         if (!state.createdAt && entry.timestamp) state.createdAt = entry.timestamp
-        if ((entry.type === 'user' || entry.type === 'assistant') && entry.message?.role) {
+        if ((entry.type === 'user' || entry.type === 'assistant') && resolveEntryMessageRole(entry)) {
           state.count++
           if (!entry.isMeta) state.modifiedAt = this.latestTimestamp(state.modifiedAt, entry.timestamp)
         }
@@ -1580,7 +1618,7 @@ export class SessionService {
         }
         state.goalTitle ??= extractGoalCreationTitle(entry)
         if (entry.type === 'ai-title' && entry.aiTitle) state.aiTitle = cleanSessionTitleSource(String(entry.aiTitle)) || state.aiTitle
-        if (!state.firstUserTitle && entry.type === 'user' && !entry.isMeta && entry.message?.role === 'user') state.firstUserTitle = extractTranscriptUserTitle(entry.message.content)
+        if (!state.firstUserTitle && entry.type === 'user' && !entry.isMeta && resolveEntryMessageRole(entry) === 'user') state.firstUserTitle = extractTranscriptUserTitle(entry.message?.content)
         // Metadata has a separate fixed bound even when a file contains only
         // a handful of maliciously large scalar values or repository fields.
         if (Buffer.byteLength(JSON.stringify(state)) > 128 * 1024) throw new ApiError(413, 'Session metadata exceeds its resource budget', 'SESSION_METADATA_TOO_LARGE')
@@ -1968,7 +2006,7 @@ export class SessionService {
       if (
         !entry.isMeta &&
         (entry.type === 'user' || entry.type === 'assistant') &&
-        entry.message?.role
+        resolveEntryMessageRole(entry)
       ) {
         modifiedAt = this.latestTimestamp(modifiedAt, entry.timestamp)
       }
@@ -2059,6 +2097,17 @@ export class SessionService {
     workDir: string | null
     fallbackProjectDir?: string
   }): Promise<string | null> {
+    const sourceDirectory = worktreeSession?.originalCwd || repository?.requestedWorkDir || workDir
+    const identity = readProjectIdentity(this.getConfigDir())
+    if (sourceDirectory && identity.roots.length > 0) {
+      const nativeDirectory = await fs.realpath(sourceDirectory).catch(() => sourceDirectory)
+      const explicitRoot = findExplicitProjectRoot(nativeDirectory, identity.roots)
+      if (explicitRoot) {
+        const sourceGitRoot = findCanonicalGitRootPreservingPathIdentity(nativeDirectory)
+        if (!sourceGitRoot || findExplicitProjectRoot(explicitRoot, [sourceGitRoot])) return explicitRoot
+      }
+    }
+
     const candidate = worktreeSession?.originalCwd ||
       repository?.repoRoot ||
       workDir ||
@@ -2090,7 +2139,7 @@ export class SessionService {
   private countTranscriptMessages(entries: RawEntry[]): number {
     return entries.filter((entry) =>
       !entry.isMeta &&
-      !!entry.message?.role &&
+      !!resolveEntryMessageRole(entry) &&
       (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
     ).length
   }
@@ -2098,10 +2147,10 @@ export class SessionService {
   /** A real conversation, including a collaboration delivery persisted as isMeta. */
   private hasConversationTranscript(entries: RawEntry[]): boolean {
     return entries.some((entry) => {
-      if (!entry.message?.role) return false
+      if (!resolveEntryMessageRole(entry)) return false
       if (entry.type !== 'user' && entry.type !== 'assistant' && entry.type !== 'system') return false
       if (!entry.isMeta) return true
-      return entry.type === 'user' && parseSessionCollaborationEnvelope(entry.message.content) !== null
+      return entry.type === 'user' && parseSessionCollaborationEnvelope(entry.message?.content) !== null
     })
   }
 
@@ -2154,12 +2203,13 @@ export class SessionService {
     parentToolUseId?: string,
   ): MessageEntry | null {
     const msg = entry.message
-    if (!msg || !msg.role) return null
+    const role = resolveEntryMessageRole(entry)
+    if (!msg || !role) return null
 
     // The CLI records an explicit interrupt as a synthetic user message.
     // Project it as a status so history retains the stop boundary without
     // displaying the model-facing sentinel as a user prompt.
-    if (msg.role === 'user' && this.isSyntheticUserInterruption(msg.content)) {
+    if (role === 'user' && this.isSyntheticUserInterruption(msg.content)) {
       return {
         id: entry.uuid || crypto.randomUUID(),
         type: 'system',
@@ -2170,7 +2220,6 @@ export class SessionService {
 
     // Determine our normalized type
     let type: MessageEntry['type']
-    const role = msg.role
 
     if (role === 'user') {
       // Check if the content is a tool_result array
@@ -2235,6 +2284,13 @@ export class SessionService {
         })
       }
     }
+    const durationMs =
+      type === 'tool_result' &&
+      typeof entry.durationMs === 'number' &&
+      Number.isFinite(entry.durationMs) &&
+      entry.durationMs >= 0
+        ? entry.durationMs
+        : undefined
     return {
       id: entry.uuid || crypto.randomUUID(),
       type,
@@ -2247,6 +2303,7 @@ export class SessionService {
       ...(scheduledTask ? { scheduledTask } : {}),
       ...(entry.bodyTruncated === true ? { bodyTruncated: true } : {}),
       ...(entry.toolUseResult !== undefined ? { toolUseResult: entry.toolUseResult } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
       timestamp: entry.timestamp || new Date().toISOString(),
       model: msg.model,
       ...(usage ? { usage } : {}),
@@ -2326,8 +2383,8 @@ export class SessionService {
    * that follows exists, without the model-facing XML.
    */
   private backgroundContinueEntryToMessage(entry: RawEntry): MessageEntry | null {
-    if (entry.type !== 'user' || entry.message?.role !== 'user') return null
-    const content = entry.message.content
+    if (entry.type !== 'user' || resolveEntryMessageRole(entry) !== 'user') return null
+    const content = entry.message?.content
     if (!this.isTaskNotificationContent(content)) return null
     const notifications = this.extractTextBlocks(content)
       .flatMap((text) => text.match(TASK_NOTIFICATION_BLOCKS_RE) ?? [])
@@ -2454,7 +2511,7 @@ export class SessionService {
   }
 
   private shouldHideTranscriptEntry(entry: RawEntry): boolean {
-    const role = entry.message?.role
+    const role = resolveEntryMessageRole(entry)
     const content = entry.message?.content
 
     if (role === 'user') {
@@ -2474,10 +2531,10 @@ export class SessionService {
   }
 
   private isVisibleTranscriptMessageEntry(entry: RawEntry): boolean {
-    if (!entry.message?.role) return false
+    if (!resolveEntryMessageRole(entry)) return false
     // Collaboration deliveries are persisted as isMeta prompts; they carry a real
     // cross-session message the user must see, so they are the one exception.
-    if (entry.isMeta && !parseSessionCollaborationEnvelope(entry.message.content)) return false
+    if (entry.isMeta && !parseSessionCollaborationEnvelope(entry.message?.content)) return false
     if (
       entry.type !== 'user' &&
       entry.type !== 'assistant' &&
@@ -2655,7 +2712,7 @@ export class SessionService {
     const messages: MessageEntry[] = []
 
     for (const entry of entries) {
-      if (!entry.message?.role || entry.isMeta) continue
+      if (!entry.message || !resolveEntryMessageRole(entry) || entry.isMeta) continue
       if (this.shouldHideTranscriptEntry(entry)) continue
       if (entry.type !== 'user' && entry.type !== 'assistant' && entry.type !== 'system') {
         continue
@@ -2877,8 +2934,8 @@ export class SessionService {
 
     // 4. Look for first non-meta user message as title
     for (const e of entries) {
-      if (e.type === 'user' && !e.isMeta && e.message?.role === 'user') {
-        const title = extractTranscriptUserTitle(e.message.content)
+      if (e.type === 'user' && !e.isMeta && resolveEntryMessageRole(e) === 'user') {
+        const title = extractTranscriptUserTitle(e.message?.content)
         if (title) return title
       }
     }
@@ -3148,6 +3205,10 @@ export class SessionService {
     model: string,
     launchInfoOverride?: ProviderContextWindowHint | null,
     hints: { autoCompactWindow?: string } = {},
+    officialRuntimeEnvs?: {
+      openAI?: Record<string, string> | null
+      grok?: Record<string, string> | null
+    },
   ): Promise<number | undefined> {
     const launchInfo = launchInfoOverride ?? await this.getSessionLaunchInfo(sessionId).catch(() => null)
     const providerIds: string[] = []
@@ -3187,7 +3248,11 @@ export class SessionService {
     let sessionProviderAutoCompactWindow: string | undefined
     let sawSessionProvider = false
     for (const providerId of providerIds) {
-      const env = await this.providerService.getProviderRuntimeEnv(providerId).catch(() => null)
+      const env = officialRuntimeEnvs?.openAI !== undefined && isOpenAIOfficialProviderId(providerId)
+        ? officialRuntimeEnvs.openAI
+        : officialRuntimeEnvs?.grok !== undefined && isGrokOfficialProviderId(providerId)
+          ? officialRuntimeEnvs.grok
+          : await this.providerService.getProviderRuntimeEnv(providerId, { cachedCatalogOnly: true }).catch(() => null)
       hints.autoCompactWindow = env?.[AUTO_COMPACT_WINDOW_ENV_KEY]
       if (env && !sawSessionProvider) {
         sawSessionProvider = true
@@ -3339,6 +3404,10 @@ export class SessionService {
     sessionId: string,
     model: string,
     launchInfo?: ProviderContextWindowHint | null,
+    officialRuntimeEnvs?: {
+      openAI?: Record<string, string> | null
+      grok?: Record<string, string> | null
+    },
   ): Promise<number> {
     const hints: { autoCompactWindow?: string } = {}
     const providerContextWindow = await this.getProviderContextWindowForSession(
@@ -3346,6 +3415,7 @@ export class SessionService {
       model,
       launchInfo,
       hints,
+      officialRuntimeEnvs,
     )
     if (providerContextWindow !== undefined) {
       return applyAutoCompactWindowLimit(providerContextWindow, hints.autoCompactWindow, true)
@@ -3372,8 +3442,8 @@ export class SessionService {
     return (await this.getInspectionTranscriptSnapshot(sessionId))?.metadata ?? null
   }
 
-  private async buildTranscriptContextEstimate(
-    sessionId: string,
+  private buildTranscriptContextEstimate(
+    rawMaxTokens: number,
     latest: {
       model: string
       inputTokens: number
@@ -3384,12 +3454,10 @@ export class SessionService {
     estimatedTokensFromMessages: number,
     estimatedTokensAfterUsage: number,
     transcriptHasMediaInput: boolean,
-    launchInfo?: ProviderContextWindowHint | null,
-  ): Promise<TranscriptContextEstimate> {
-    const rawMaxTokens = await this.getSessionModelContextWindow(sessionId, latest.model, launchInfo)
+  ): TranscriptContextEstimate {
     const promptTokens = latest.inputTokens + latest.cacheReadInputTokens + latest.cacheCreationInputTokens
     const providerTokens = promptTokens + latest.outputTokens
-    const hasProviderUsage = providerTokens > 0
+    const hasProviderUsage = promptTokens > 0
     const estimatedTokens = estimatedTokensFromMessages || promptTokens
     const contextBudget = calculateContextBudget({
       estimatedTokens,
@@ -3408,10 +3476,7 @@ export class SessionService {
     const totalTokens =
       hasProviderUsage && !contextBudget.ignoredUsageReason
         ? Math.min(
-            Math.max(
-              contextBudget.usedTokens,
-              providerTokens + estimatedTokensAfterUsage,
-            ),
+            providerTokens + estimatedTokensAfterUsage,
             rawMaxTokens,
           )
         : contextBudget.usedTokens
@@ -3481,9 +3546,15 @@ export class SessionService {
     const stat = await fs.stat(found.filePath, { bigint: true })
     // The transcript is immutable between polls, but its interpreted token budget
     // also depends on editable provider settings and process-level overrides.
-    const providers = await this.providerService.listProviders().catch(() => null)
+    const [providers, openAIRuntimeEnv, grokRuntimeEnv] = await Promise.all([
+      this.providerService.listProviders().catch(() => null),
+      this.providerService.getProviderRuntimeEnv(OPENAI_OFFICIAL_PROVIDER_ID, { cachedCatalogOnly: true }).catch(() => null),
+      this.providerService.getProviderRuntimeEnv(GROK_OFFICIAL_PROVIDER_ID, { cachedCatalogOnly: true }).catch(() => null),
+    ])
     const contextRevision = createHash('sha256').update(JSON.stringify({
       activeId: providers?.activeId,
+      openAIRuntimeEnv,
+      grokRuntimeEnv,
       providers: providers?.providers.map(provider => ({
         id: provider.id,
         models: provider.models,
@@ -3502,7 +3573,10 @@ export class SessionService {
     const existing = this.inspectionSnapshots.get(key)
     if (existing) return existing
     const request = (async () => {
-      const snapshot = await this.readInspectionTranscriptSnapshot(sessionId)
+      const snapshot = await this.readInspectionTranscriptSnapshot(sessionId, {
+        openAI: openAIRuntimeEnv,
+        grok: grokRuntimeEnv,
+      })
       const after = await fs.stat(found.filePath, { bigint: true })
       if (after.dev !== stat.dev || after.ino !== stat.ino || after.size !== stat.size || after.mtimeNs !== stat.mtimeNs || after.ctimeNs !== stat.ctimeNs) {
         throw ApiError.conflict('Transcript changed during inspection; retry the request')
@@ -3518,7 +3592,13 @@ export class SessionService {
     catch (error) { this.inspectionSnapshots.delete(key); throw error }
   }
 
-  private async readInspectionTranscriptSnapshot(sessionId: string): Promise<SessionInspectionTranscriptSnapshot | null> {
+  private async readInspectionTranscriptSnapshot(
+    sessionId: string,
+    officialRuntimeEnvs: {
+      openAI: Record<string, string> | null
+      grok: Record<string, string> | null
+    },
+  ): Promise<SessionInspectionTranscriptSnapshot | null> {
     const found = await this.findSessionFile(sessionId)
     if (!found) return null
 
@@ -3611,7 +3691,7 @@ export class SessionService {
 
       if (
         !entry.isMeta &&
-        !!entry.message?.role &&
+        !!resolveEntryMessageRole(entry) &&
         (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
       ) {
         transcriptMessageCount += 1
@@ -3736,6 +3816,7 @@ export class SessionService {
         sessionId,
         modelUsage.model,
         modelRuntimeHints.get(modelUsage.model),
+        officialRuntimeEnvs,
       )
     }
 
@@ -3767,13 +3848,12 @@ export class SessionService {
         }
     const latestContextUsage = resolveTranscriptContextUsage(contextState)
     const contextEstimate = latestContextUsage
-      ? await this.buildTranscriptContextEstimate(
-          sessionId,
+      ? this.buildTranscriptContextEstimate(
+          await this.getSessionModelContextWindow(sessionId, latestContextUsage.model, launchInfo, officialRuntimeEnvs),
           latestContextUsage,
           contextState.estimatedTokensFromMessages,
-          contextState.estimatedTokensAfterUsage,
+          contextState.estimatedTokensAfterUsage + contextState.unreportedOutputTokens,
           contextState.transcriptHasMediaInput,
-          launchInfo,
         )
       : null
 
@@ -3807,7 +3887,7 @@ export class SessionService {
     const status = indexed ? this.localIndexGateway.getPublicStatus() : null
     const degradedPlan = indexed ? null : this.getDegradedListPlan()
     return JSON.stringify([scope, this.sessionListCacheGeneration,
-      readSessionArchives(scope).revision,
+      readSessionArchives(scope).revision, readProjectIdentity(scope).revision,
       indexed && (status?.state === 'ready' || status?.state === 'building')
         ? status.lastUpdatedAt
         : degradedPlan
@@ -3869,7 +3949,7 @@ export class SessionService {
       // Thousands of sessions normally share a handful of workspaces. Resolve
       // each candidate once, preserving the same worktree/git boundary as list.
       const candidate = row.worktreeSession?.originalCwd || row.repository?.repoRoot || row.workDir || this.desanitizePath(row.projectPath)
-      const key = JSON.stringify([candidate, Boolean(row.workDir)])
+      const key = JSON.stringify([candidate, row.workDir, row.repository?.requestedWorkDir])
       let root = roots.get(key)
       if (!roots.has(key)) {
         root = await this.resolveProjectRootFromSessionMetadata({
@@ -3940,12 +4020,13 @@ export class SessionService {
     const scope = this.getConfigDir()
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const archiveRevision = readSessionArchives(scope).revision
+      const identityRevision = readProjectIdentity(scope).revision
       const result = await this.listSessionsOnce(options)
       // A storage switch belongs to subsequent requests. Repeating this scan
       // after a switch would replace its original scope with another config's sessions.
-      if (scope !== this.getConfigDir() || archiveRevision === readSessionArchives(scope).revision) return result
+      if (scope !== this.getConfigDir() || (archiveRevision === readSessionArchives(scope).revision && identityRevision === readProjectIdentity(scope).revision)) return result
     }
-    throw new ApiError(409, 'Session archives changed during loading; retry', 'SESSION_LIST_CHANGED')
+    throw new ApiError(409, 'Session projects or archives changed during loading; retry', 'SESSION_LIST_CHANGED')
   }
 
   private async listSessionsOnce(options?: SessionListOptions): Promise<{ sessions: SessionListItem[]; total: number }> {
@@ -4718,7 +4799,13 @@ export class SessionService {
 
   /** Read only the addressed Agent call and result. Ordinary transcript bodies
    * are parsed one bounded record at a time and never retained by card lookup. */
-  async getSubagentRunLookup(sessionId: string, toolRef: string, agentId?: string): Promise<SubagentTranscript> {
+  async getSubagentRunLookup(
+    sessionId: string,
+    toolRef: string,
+    agentId?: string,
+    signal?: AbortSignal,
+  ): Promise<SubagentTranscript> {
+    signal?.throwIfAborted()
     const found = await this.findSessionFile(sessionId)
     if (!found) throw ApiError.notFound(`Session not found: ${sessionId}`)
     const filePath = agentId ? this.subagentTranscriptPath(found.projectDir, sessionId, agentId) : found.filePath
@@ -4733,7 +4820,7 @@ export class SessionService {
     const key = JSON.stringify([filePath, toolRef])
     const cached = this.subagentLookupCache.get(key)
     if (cached?.version === version) return cached.transcript
-    return withHistoryReadBudget(undefined, async () => {
+    return withHistoryReadBudget(signal, async () => {
       const entries: RawEntry[] = []
       const taskNotifications = new Map<string, SessionTaskNotification>()
       let bytes = 0
@@ -4761,7 +4848,7 @@ export class SessionService {
         for (const notice of notices) {
           taskNotifications.set(sessionTaskNotificationIdentity(notice), notice)
         }
-      }, undefined, { maxRecordBytes: HISTORY_SEMANTIC_RECORD_BYTES })
+      }, signal, { maxRecordBytes: HISTORY_SEMANTIC_RECORD_BYTES })
       // A skipped record may be unrelated to this Agent. Preserve the evidence
       // we did read without claiming that absence proves a missing run.
       const transcript = { messages: this.entriesToMessages(entries), taskNotifications: [...taskNotifications.values()], historyComplete: !incomplete && scan.omittedRecords === 0 }
@@ -4775,9 +4862,10 @@ export class SessionService {
   async getSubagentTranscript(
     sessionId: string,
     agentId: string,
-    options: { bounded?: boolean; toolUseId?: string } = {},
+    options: { bounded?: boolean; toolUseId?: string; signal?: AbortSignal } = {},
   ): Promise<SubagentTranscript> {
-    if (options.toolUseId) return this.getSubagentRunLookup(sessionId, options.toolUseId, agentId)
+    options.signal?.throwIfAborted()
+    if (options.toolUseId) return this.getSubagentRunLookup(sessionId, options.toolUseId, agentId, options.signal)
     const found = await this.findSessionFile(sessionId)
     if (!found) throw ApiError.notFound(`Session not found: ${sessionId}`)
     const filePath = this.subagentTranscriptPath(found.projectDir, sessionId, agentId)
@@ -4786,7 +4874,7 @@ export class SessionService {
         // A byte-bounded small transcript can preserve the full Activity view,
         // including more than 1000 tiny records. Large files use the tail page.
         if ((await fs.stat(filePath)).size <= 1536 * 1024) {
-          return await withHistoryReadBudget(undefined, async () => {
+          return await withHistoryReadBudget(options.signal, async () => {
             const entries: RawEntry[] = []
             let retainedBytes = 0
             const scan = await streamBoundedHistory(filePath, entry => {
@@ -4794,12 +4882,12 @@ export class SessionService {
               if (retainedBytes > 2 * 1024 * 1024) throw new ApiError(413, 'Agent transcript changed beyond its viewing budget', 'SUBAGENT_RECORD_LIMIT')
               if (entries.length >= 10_000) throw new ApiError(413, 'Agent transcript exceeds its record budget', 'SUBAGENT_RECORD_LIMIT')
               entries.push(entry as RawEntry)
-            }, undefined, { maxRecordBytes: HISTORY_SEMANTIC_RECORD_BYTES })
+            }, options.signal, { maxRecordBytes: HISTORY_SEMANTIC_RECORD_BYTES })
             return { messages: this.entriesToMessages(entries), taskNotifications: this.taskNotificationsFromEntries(entries), historyComplete: scan.omittedRecords === 0 }
           })
         }
-        const result = await readBoundedHistoryPage(filePath)
-        const projection = await this.projectHistoryPageEntries(filePath, result, undefined, true)
+        const result = await readBoundedHistoryPage(filePath, { signal: options.signal })
+        const projection = await this.projectHistoryPageEntries(filePath, result, options.signal, true)
         const entries = result.entries.map(item => item.entry as RawEntry)
         return {
           messages: this.entriesToMessages(projection.entries),
@@ -4860,7 +4948,9 @@ export class SessionService {
     sessionId: string,
     toolUseId: string,
     expectedOwnerAgentId: string | null,
+    signal?: AbortSignal,
   ): Promise<string | null> {
+    signal?.throwIfAborted()
     const found = await this.findSessionFile(sessionId)
     if (!found) {
       throw ApiError.notFound(`Session not found: ${sessionId}`)
@@ -4878,6 +4968,7 @@ export class SessionService {
     let metadataComplete = true
 
     for (const metadataFile of files.filter((file) => file.endsWith('.meta.json'))) {
+      signal?.throwIfAborted()
       try {
         const metadata = await this.readSubagentMetadata(path.join(subagentsDir, metadataFile))
         if (metadata.toolUseId !== toolUseId) continue
@@ -4890,6 +4981,7 @@ export class SessionService {
         })
       } catch (error) {
         if (error instanceof ApiError) throw error
+        if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError')
         // A half-written sidecar must not hide the other candidates.
         metadataComplete = false
       }
@@ -4920,8 +5012,9 @@ export class SessionService {
   async getSubagentTranscriptFragmentsByAgentType(
     sessionId: string,
     agentType: string,
-    options: { bounded?: boolean; toolUseId?: string } = {},
+    options: { bounded?: boolean; toolUseId?: string; signal?: AbortSignal } = {},
   ): Promise<SubagentTranscriptFragment[]> {
+    options.signal?.throwIfAborted()
     const found = await this.findSessionFile(sessionId)
     if (!found) {
       throw ApiError.notFound(`Session not found: ${sessionId}`)
@@ -4938,6 +5031,7 @@ export class SessionService {
     const fragments: SubagentTranscriptFragment[] = []
 
     for (const metadataFile of files.filter((file) => file.endsWith('.meta.json'))) {
+      options.signal?.throwIfAborted()
       try {
         const metadata = await this.readSubagentMetadata(path.join(subagentsDir, metadataFile))
         if (metadata.agentType !== agentType) continue
@@ -4956,6 +5050,7 @@ export class SessionService {
         if (options.bounded && (fragments.length > 16 || Buffer.byteLength(JSON.stringify(fragments)) > 4 * 1024 * 1024)) throw new ApiError(413, 'Agent fragments exceed their viewing budget', 'SUBAGENT_FRAGMENTS_LIMIT')
       } catch (error) {
         if (error instanceof ApiError) throw error
+        if (options.signal?.aborted) throw options.signal.reason ?? new DOMException('Aborted', 'AbortError')
         // A partially persisted fragment must not hide the other resumable runs.
       }
     }
@@ -5027,7 +5122,7 @@ export class SessionService {
       sessionId,
     )
     const absWorkDir = preparedWorkspace.workDir
-    const { additionalDirectories: configuredDirectories } = await new DesktopUiPreferencesService().getProjectDirectories(absWorkDir)
+    const { additionalDirectories: configuredDirectories } = await new DesktopUiPreferencesService().getProjectDirectories(preparedWorkspace.repository?.requestedWorkDir || absWorkDir)
     const additionalDirectories = await validateProjectAdditionalDirectories(absWorkDir, configuredDirectories)
     registerCanonicalFilesystemAccessRoot(absWorkDir)
     console.log(
@@ -5737,7 +5832,7 @@ export class SessionService {
       if (typeof entry.uuid !== 'string') return true
       if (removedIds.has(entry.uuid)) return false
       if (
-        entry.message?.role &&
+        resolveEntryMessageRole(entry) &&
         (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
       ) {
         return remainingMessageIds.has(entry.uuid)
@@ -6063,8 +6158,8 @@ export class SessionService {
     for (const entry of entries) {
       const notification = entry.type === PERSISTED_TASK_NOTIFICATION_ENTRY_TYPE
         ? this.parsePersistedTaskNotification(entry.taskNotification, entry.timestamp)
-        : entry.message?.role === 'user'
-          ? this.parseTaskNotificationContent(entry.message.content, entry.timestamp)
+        : resolveEntryMessageRole(entry) === 'user'
+          ? this.parseTaskNotificationContent(entry.message?.content, entry.timestamp)
           : this.parseQueuedTaskNotification(entry)
       if (notification) {
         notifications.set(sessionTaskNotificationIdentity(notification), notification)
@@ -6101,7 +6196,7 @@ export class SessionService {
       }
 
       // Only process transcript entries (user / assistant / system with messages)
-      if (!entry.message?.role) continue
+      if (!resolveEntryMessageRole(entry)) continue
 
       // Checked before the isMeta skip: the batch of settled agents is isMeta.
       const backgroundContinue = this.backgroundContinueEntryToMessage(entry)
@@ -6113,7 +6208,7 @@ export class SessionService {
       // Skip meta entries (CLI internal bookkeeping). Collaboration deliveries
       // are the exception: the isMeta prompt carries a real cross-session
       // message that must render as an ordinary user-position bubble.
-      if (entry.isMeta && !parseSessionCollaborationEnvelope(entry.message.content)) continue
+      if (entry.isMeta && !parseSessionCollaborationEnvelope(entry.message?.content)) continue
 
       // Anything else hidden here is system plumbing. What the assistant does in
       // response to a projected notification is ordinary conversation, so it is

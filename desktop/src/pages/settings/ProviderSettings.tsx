@@ -10,6 +10,7 @@ import {
   ChevronUp,
   CircleAlert,
   CircleCheck,
+  Cloud,
   Download,
   Globe,
   GripVertical,
@@ -17,6 +18,7 @@ import {
   Key,
   KeyRound,
   KeySquare,
+  Layers,
   Link,
   MapPin,
   MessagesSquare,
@@ -25,6 +27,7 @@ import {
   Route,
   Search,
   SearchX,
+  Server,
   Shrink,
   Star,
   Wrench,
@@ -49,6 +52,7 @@ import { SettingsPageHeader, SettingsPill } from '@/components/settings/Settings
 import { Dropdown } from '@/components/ui/Dropdown'
 import { SegmentedControl } from '@/components/ui/SegmentedControl'
 import { Tooltip } from '@/components/ui/Tooltip'
+import { ModelBrandIcon, resolveModelBrand } from '@/components/composite/ModelBrandIcon'
 import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ModelApiFormat, ProviderAuthStrategy, ProviderModelInfo, ProviderModelsErrorCode, ProviderKeyPool, ProviderApiKeyEntry, ProviderApiKeyConfig, ProviderModelBinding } from '../../types/provider'
 import { normalizeKeyPoolDraft, toStoredKeyPool } from '../../lib/providerKeyPool'
 import { ProviderKeyPoolSection } from './ProviderKeyPoolSection'
@@ -221,7 +225,12 @@ function providerSubtitle(provider: SavedProvider): string {
 function providerFormatBadge(provider: SavedProvider, preset: ProviderPreset | undefined, t: Translate): string | null {
   if (preset?.modelApiFormats?.length) return t('settings.providers.multiProtocolBadge')
   if (!provider.apiFormat || provider.apiFormat === 'anthropic') return null
-  return provider.apiFormat === 'openai_chat' ? 'OpenAI Chat' : 'OpenAI Responses'
+  if (provider.apiFormat === 'openai_chat') return 'OpenAI Chat'
+  if (provider.apiFormat === 'openai_responses') return 'OpenAI Responses'
+  if (provider.apiFormat === 'google_vertex') return 'Vertex AI'
+  if (provider.apiFormat === 'bedrock_converse') return 'Bedrock'
+  if (provider.apiFormat === 'azure_openai') return 'Azure OpenAI'
+  return 'Gemini'
 }
 
 /** What a saved provider is searched by. The API key never is. */
@@ -468,15 +477,29 @@ export function ProviderSettings({ browserMode = false }: { browserMode?: boolea
           dragLabel={t('settings.providers.dragToReorder')}
           dragDisabled={searching}
           onActivate={!isActive ? activate : undefined}
+          icon={(
+            <ModelBrandIcon
+              providerId={item.id}
+              size={15}
+              className={isActive ? 'text-[var(--color-brand)]' : 'text-[var(--color-text-secondary)]'}
+            />
+          )}
           title={<HighlightedText text={t(official.title)} terms={terms} />}
           subtitle={<HighlightedText text={t(official.subtitle)} terms={terms} />}
           badges={isActive ? (
             <Badge tone="brand">{t('settings.providers.default')}</Badge>
           ) : null}
-          details={!browserMode && isActive ? (
-            <div className="flex flex-col">
-              <official.Login />
-              <OfficialProviderModelSettings providerId={item.id} />
+          details={!browserMode ? (
+            <div className="flex flex-col gap-3">
+              {isActive ? (
+                <>
+                  <official.Login />
+                  <OfficialProviderModelSettings providerId={item.id} />
+                </>
+              ) : item.kind === 'claude-official' ? <ClaudeOfficialLogin usageOnly /> : null}
+              {item.kind !== 'claude-official' && (
+                <p className="text-xs text-[var(--color-text-secondary)]">{t('settings.providers.officialUsageNotIntegrated')}</p>
+              )}
             </div>
           ) : null}
         />
@@ -499,6 +522,15 @@ export function ProviderSettings({ browserMode = false }: { browserMode?: boolea
         dragLabel={t('settings.providers.dragToReorder')}
         dragDisabled={searching}
         onActivate={!isActive ? () => handleActivate(provider.id) : undefined}
+        icon={(
+          <ModelBrandIcon
+            presetId={provider.presetId}
+            providerName={provider.name}
+            modelId={resolveModelBrand({ presetId: provider.presetId, providerName: provider.name }) ? undefined : provider.models.main}
+            size={15}
+            className={isActive ? 'text-[var(--color-brand)]' : 'text-[var(--color-text-secondary)]'}
+          />
+        )}
         title={<HighlightedText text={provider.name} terms={terms} />}
         subtitle={<span className="font-mono text-[11px]"><HighlightedText text={providerSubtitle(provider)} terms={terms} /></span>}
         matchNote={match?.hiddenField ? (
@@ -745,6 +777,7 @@ type SortableProviderCardProps = {
   dragLabel: string
   /** While searching the list is a filtered view, so it is not reorderable. */
   dragDisabled?: boolean
+  icon?: ReactNode
   title: ReactNode
   subtitle: ReactNode
   badges?: ReactNode
@@ -776,6 +809,7 @@ function SortableProviderCard({
   isActive,
   dragLabel,
   dragDisabled = false,
+  icon,
   title,
   subtitle,
   badges,
@@ -808,13 +842,13 @@ function SortableProviderCard({
       style={style}
       data-testid={providerItemTestId(item)}
       className={cx(
-        'group relative flex flex-wrap items-start gap-x-2.5 gap-y-2 rounded-[var(--radius-lg)] border bg-[var(--color-surface-container-lowest)] p-[14px] pl-1.5',
+        'group relative flex flex-wrap items-start gap-x-2.5 gap-y-2 rounded-[var(--radius-lg)] border bg-[var(--color-surface-container)] p-[14px] pl-1.5',
         'transition-[border-color,box-shadow] duration-150 ease-out',
-        // The default provider: a terracotta-mixed hairline plus a soft brand
+        // The default provider: a cobalt/accent-mixed hairline plus a soft brand
         // halo. Not the focus color, which would collide with the real focus ring.
         isActive
           ? 'border-[var(--color-primary-fixed-dim)] shadow-[0_0_0_3px_var(--color-brand-soft)]'
-          : 'border-[var(--color-border)] hover:border-[var(--color-outline)]',
+          : 'border-[var(--color-border)] shadow-[var(--bevel-surface-rest)] hover:border-[var(--color-outline)]',
         isDragging && 'opacity-90 shadow-[var(--shadow-dropdown)]',
       )}
     >
@@ -857,6 +891,7 @@ function SortableProviderCard({
         />
         <span className="min-w-0 flex-1">
           <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            {icon}
             <span className="min-w-0 truncate text-sm font-semibold leading-5 text-[var(--color-text-primary)]">{title}</span>
             {badges}
           </span>
@@ -1590,6 +1625,9 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
         const mergedEnv: Record<string, unknown> = {
           ...cleanedEnv,
           ...omitAuthEnv(selectedPreset.defaultEnv),
+          ...(writesManagedSettings && settings.providerEnvOwner === provider?.id && typeof existingEnv.CLAUDE_CODE_SUBAGENT_MODEL === 'string'
+            ? { CLAUDE_CODE_SUBAGENT_MODEL: existingEnv.CLAUDE_CODE_SUBAGENT_MODEL }
+            : {}),
           ...(autoCompactWindowEnv ? { [AUTO_COMPACT_WINDOW_ENV_KEY]: autoCompactWindowEnv } : {}),
           ...(Object.keys(modelContextWindows).length > 0
             ? { [MODEL_CONTEXT_WINDOWS_ENV_KEY]: JSON.stringify(modelContextWindows) }
@@ -1615,6 +1653,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
         // (or whatever was last selected) and saving would write that back.
         delete merged.model
         delete merged.modelContext
+        delete merged.providerEnvOwner
         setSettingsJson(JSON.stringify(writeCompatibilityJson(merged, apiFormat === 'anthropic' ? parseAnthropicBudgetForm(compatibility) : parseCompatibilityForm(compatibility)), null, 2))
       }).catch(() => {
         if (!cancelled && !settingsJsonUserEditedRef.current) {
@@ -1640,7 +1679,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
     setModelsErrorCode(null)
     setModelsErrorMessage(null)
     setIsFetchingModels(false)
-  }, [baseUrl, apiKey])
+  }, [baseUrl, apiKey, apiFormat])
 
   const handlePresetChange = (preset: ProviderPreset) => {
     if (preset.id === MAGPIE_PRESET_ID && onPickMagpie) {
@@ -1679,7 +1718,9 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
     setTestResult(null)
   }
 
-  const requiresApiKey = selectedPreset.needsApiKey !== false
+  const allowsAmbientCloudCredential =
+    apiFormat === 'google_vertex' || apiFormat === 'bedrock_converse'
+  const requiresApiKey = selectedPreset.needsApiKey !== false && !allowsAmbientCloudCredential
   const autoCompactWindowErrorKey = getAutoCompactWindowErrorKey(autoCompactWindow)
   const modelContextWindowErrorSlots = MODEL_SLOTS.filter((slot) => getModelContextWindowErrorKey(modelContextInputs[slot]))
   const compatibilityInvalid = invalidCompatibilityNumber(compatibility.maxOutputTokens)
@@ -1729,6 +1770,26 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
       value: 'openai_responses' as const,
       label: t('settings.providers.apiFormatOpenaiResponses'),
       icon: <Route size={16} strokeWidth={1.75} aria-hidden="true" />,
+    },
+    {
+      value: 'gemini' as const,
+      label: t('settings.providers.apiFormatGemini'),
+      icon: <Layers size={16} strokeWidth={1.75} aria-hidden="true" />,
+    },
+    {
+      value: 'google_vertex' as const,
+      label: t('settings.providers.apiFormatGoogleVertex'),
+      icon: <Cloud size={16} strokeWidth={1.75} aria-hidden="true" />,
+    },
+    {
+      value: 'bedrock_converse' as const,
+      label: t('settings.providers.apiFormatBedrockConverse'),
+      icon: <Server size={16} strokeWidth={1.75} aria-hidden="true" />,
+    },
+    {
+      value: 'azure_openai' as const,
+      label: t('settings.providers.apiFormatAzureOpenai'),
+      icon: <Globe size={16} strokeWidth={1.75} aria-hidden="true" />,
     },
   ]
   const selectedApiFormatLabel = apiFormatItems.find((item) => item.value === apiFormat)?.label ?? t('settings.providers.apiFormatAnthropic')
@@ -1944,7 +2005,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
   }
   const hasModelsBaseUrl = Boolean(baseUrl.trim())
   const hasModelsApiKey = Boolean(apiKey.trim())
-  const canFetchModels = hasModelsBaseUrl && hasModelsApiKey
+  const canFetchModels = hasModelsBaseUrl && (hasModelsApiKey || allowsAmbientCloudCredential)
   const handleFetchModels = async () => {
     if (!canFetchModels || isFetchingModels) return
     const requestId = modelsRequestRef.current + 1
@@ -1957,7 +2018,12 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
       // only covers our own server being unreachable.
       // Probe through the same per-key proxy the primary key uses for chat.
       const probeProxy = apiKeyConfig.proxy?.mode === 'follow_global' ? undefined : apiKeyConfig.proxy
-      const result = await fetchModels({ baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), ...(probeProxy && { proxy: probeProxy }) })
+      const result = await fetchModels({
+        baseUrl: baseUrl.trim(),
+        apiKey: apiKey.trim(),
+        ...((apiFormat === 'gemini' || apiFormat === 'google_vertex' || apiFormat === 'bedrock_converse' || apiFormat === 'azure_openai') && { apiFormat }),
+        ...(probeProxy && { proxy: probeProxy }),
+      })
       // The form moved on while we were probing — this answer describes a base
       // URL or key the user no longer has typed in.
       if (modelsRequestRef.current !== requestId) return
@@ -2028,6 +2094,9 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
       openai_chat: '/chat/completions',
       openai_responses: '/responses',
       gemini: ':generateContent',
+      google_vertex: 'Vertex AI',
+      bedrock_converse: '/converse',
+      azure_openai: 'Azure OpenAI',
     }
     return groupProviderModels(
       models.map((model) => ({
@@ -2213,7 +2282,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
         if (requiresApiKey && !apiKey.trim()) return
         result = await testConfig({
           baseUrl: baseUrl.trim(),
-          apiKey: apiKey.trim() || selectedPreset.defaultEnv?.ANTHROPIC_AUTH_TOKEN || 'local',
+          apiKey: apiKey.trim() || (allowsAmbientCloudCredential ? '' : selectedPreset.defaultEnv?.ANTHROPIC_AUTH_TOKEN || 'local'),
           modelId: models.main.trim(),
           authStrategy,
           apiFormat,
@@ -2347,6 +2416,12 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, initialPres
             })}
             onChange={handleLegacyKeyLineChange}
           />
+          {apiFormat === 'google_vertex' && (
+            <p className={FORM_HINT}>{t('settings.providers.apiKeyHintGoogleVertex')}</p>
+          )}
+          {apiFormat === 'bedrock_converse' && (
+            <p className={FORM_HINT}>{t('settings.providers.apiKeyHintBedrockConverse')}</p>
+          )}
         </div>
 
         {(apiKeyUrl || promoText) && (

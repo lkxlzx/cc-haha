@@ -1,15 +1,18 @@
 import { getDisclosure } from '@/lib/disclosureMemory'
+import { resolveUnreadCompletion } from '@/lib/unreadCompletion'
 import { ScheduledTaskCard } from '@/components/tasks/ScheduledTaskCard'
 import { ScheduledTaskTrigger } from '@/components/tasks/ScheduledTaskTrigger'
 import { parseScheduledTaskResult } from '@/lib/scheduledTask'
 import { openSideChat } from '@/lib/workspace/openSideChat'
 import { ConversationImageGalleryContext } from '@/components/chat/conversationImageGallery'
 import { resolveConversationImages } from '@/components/chat/conversationImages'
+import { isImageGenerationToolName } from '@/components/chat/imageGenerationTools'
+import { hasToolResultImageBlock } from '@/lib/toolResultContent'
 import { getServerBaseUrl } from '@/lib/desktopRuntime'
 import { useWorkspaceContentStore } from '@/stores/workspaceContentStore'
 import { Component, useRef, useEffect, useMemo, memo, useState, useCallback, useDeferredValue, useLayoutEffect, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { createPortal, flushSync } from 'react-dom'
-import { ArrowDown, BookMarked, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, FileStack, LoaderCircle, Settings, Target, Undo2, XCircle } from 'lucide-react'
+import { ArrowDown, BookMarked, ChevronDown, ChevronRight, FileStack, LoaderCircle, Settings, Target, Undo2 } from 'lucide-react'
 import { ApiError } from '../../api/client'
 import { sessionsApi, type SessionRewindMode, type SessionTurnCheckpoint, type WorkspaceChangedFile } from '../../api/sessions'
 import { listPendingPermissions, useChatStore } from '../../stores/chatStore'
@@ -64,7 +67,7 @@ import {
 import type { AgentTaskNotification, BackgroundAgentTask, UIMessage } from '../../types/chat'
 import type { TeamDetail, TeamWorkbenchSnapshot } from '../../types/team'
 import { formatTokenCount } from '../../lib/formatTokenCount'
-import { formatDurationMs, hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks } from '../../lib/backgroundTasks'
+import { hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks } from '../../lib/backgroundTasks'
 import { buildTurnCompletionByMessageId, type TurnCompletion } from '../../lib/turnCompletion'
 import type { TurnOutputEvidence } from '../../lib/assistantOutputTargets'
 import { isTouchH5Document } from '../../lib/touchH5'
@@ -93,7 +96,6 @@ type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
 type ToolResult = Extract<UIMessage, { type: 'tool_result' }>
 type MemoryEvent = Extract<UIMessage, { type: 'memory_event' }>
 type GoalEvent = Extract<UIMessage, { type: 'goal_event' }>
-type BackgroundTaskEvent = Extract<UIMessage, { type: 'background_task' }>
 type CompactSummaryEvent = Extract<UIMessage, { type: 'compact_summary' }>
 
 type RenderItem =
@@ -258,7 +260,7 @@ function ChatSelectionMenu({
   return createPortal(
     <div ref={popoverRef} role="toolbar" aria-label={t('chat.selectionActions')}
       onMouseDown={event => { if (event.button === 0 && !event.ctrlKey) event.preventDefault() }}
-      className="fixed z-[var(--z-popover)] inline-flex max-w-[calc(100vw-24px)] items-center rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] p-1 shadow-[var(--shadow-overlay)]"
+      className="dropdown-glass popover-motion fixed z-[var(--z-popover)] inline-flex max-w-[calc(100vw-24px)] items-center rounded-[var(--radius-lg)] p-1"
       style={{ left: selection.x, top: selection.y }}>
       <Button variant="ghost" onClick={onAdd}>{t('chat.addSelectionToChat')}</Button>
       {onSideChat && <Button variant="ghost" onClick={onSideChat}>{t('chat.askSelectionInSideChat')}</Button>}
@@ -469,86 +471,6 @@ function GoalContinuationDivider({ message }: { message: GoalEvent }) {
       </div>
     </section>
   )
-}
-
-function BackgroundTaskEventCard({ message }: { message: BackgroundTaskEvent }) {
-  const t = useTranslation()
-  const { task } = message
-  const isRunning = task.status === 'running'
-  const isFailed = task.status === 'failed'
-  const isStopped = task.status === 'stopped'
-  const duration = formatDurationMs(task.usage?.durationMs, t)
-  const detail = task.summary || task.lastToolName || task.description || task.outputFile || task.taskId
-  const label = getBackgroundTaskLabel(task.taskType, t)
-
-  return (
-    <div className="mb-2">
-      <div
-        data-testid="background-task-event-card"
-        data-status={task.status}
-        className="flex min-w-0 items-start gap-2 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 py-2"
-      >
-        <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
-          {isRunning ? (
-            <LoaderCircle size={15} strokeWidth={1.75} className="animate-spin text-[var(--color-info)]" aria-hidden="true" />
-          ) : isFailed ? (
-            <XCircle size={15} strokeWidth={2.25} className="text-[var(--color-error)]" aria-hidden="true" />
-          ) : isStopped ? (
-            <CircleStop size={15} strokeWidth={2.25} className="text-[var(--color-text-tertiary)]" aria-hidden="true" />
-          ) : (
-            <CheckCircle2 size={15} strokeWidth={2.25} className="text-[var(--color-success)]" aria-hidden="true" />
-          )}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <Bot size={14} strokeWidth={2.25} className="shrink-0 text-[var(--color-text-tertiary)]" aria-hidden="true" />
-            <span className="shrink-0 text-[12px] font-medium text-[var(--color-text-primary)]">
-              {label}
-            </span>
-            <span className="shrink-0 text-[11px] text-[var(--color-text-tertiary)]">
-              {t(`chat.backgroundAgents.status.${task.status}`)}
-            </span>
-            {task.usage?.totalTokens ? (
-              <span className="hidden shrink-0 text-[11px] text-[var(--color-text-tertiary)] sm:inline">
-                {t('chat.backgroundAgents.tokens', { count: formatTokenCount(task.usage.totalTokens) })}
-              </span>
-            ) : null}
-            {duration ? (
-              <span className="hidden shrink-0 text-[11px] text-[var(--color-text-tertiary)] sm:inline">
-                {duration}
-              </span>
-            ) : null}
-          </div>
-          <div className="mt-0.5 truncate text-[12px] leading-5 text-[var(--color-text-secondary)]">
-            {detail}
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function isAgentBackgroundTaskMessage(message: UIMessage): boolean {
-  if (message.type !== 'background_task') return false
-  if (
-    message.task.taskType === 'local_agent' ||
-    message.task.taskType === 'remote_agent' ||
-    message.task.taskType === 'dream'
-  ) {
-    return true
-  }
-  return /^Agent (?:(?:"[^"]+" )?(completed|was stopped)|(?:"[^"]+" )?failed(?::|$))/.test(
-    message.task.summary ?? '',
-  )
-}
-
-function getBackgroundTaskLabel(
-  taskType: string | undefined,
-  t: (key: TranslationKey, params?: Record<string, string | number>) => string,
-): string {
-  if (taskType === 'local_bash') return t('chat.backgroundTasks.command')
-  if (taskType === 'local_workflow') return t('chat.backgroundTasks.workflow')
-  return t('chat.backgroundTasks.task')
 }
 
 function SelectableChatMessage({
@@ -927,19 +849,23 @@ export function buildRenderModel(
       id: `group-${toolCalls[0]!.id}`,
     })
   }
-  const appendRootToolCall = (toolCall: ToolCall) => {
+  const appendRootToolCall = (toolCall: ToolCall, result: ToolResult | undefined) => {
     const nextIsAgent = toolCall.toolName === 'Agent'
+    // Keep returned pictures with their source row when surrounding activity folds.
+    const separateImageRow = !nextIsAgent && !isImageGenerationToolName(toolCall.toolName)
+      && hasToolResultImageBlock(result?.content)
     // Agent runs render as their own dispatch cards, so they never mix with
     // ordinary steps — including the thinking that preceded the dispatch.
     const pendingIsAgentGroup = pendingToolCount > 0 && pendingAgentCount === pendingToolCount
     const pendingBlocksAgent = nextIsAgent && pendingSteps.length > pendingAgentCount
 
-    if (pendingBlocksAgent || (pendingToolCount > 0 && pendingIsAgentGroup !== nextIsAgent)) {
+    if (separateImageRow || pendingBlocksAgent || (pendingToolCount > 0 && pendingIsAgentGroup !== nextIsAgent)) {
       flushGroup()
     }
     pendingSteps.push({ kind: 'tool', toolCall })
     pendingToolCount += 1
     if (nextIsAgent) pendingAgentCount += 1
+    if (separateImageRow) flushGroup()
   }
   const appendThinking = (message: Extract<UIMessage, { type: 'thinking' }>) => {
     if (pendingToolCount > 0 && pendingAgentCount === pendingToolCount) flushGroup()
@@ -1016,7 +942,13 @@ export function buildRenderModel(
     if (msg.type === 'assistant_text' && !msg.content.trim()) {
       continue
     }
-    if (isAgentBackgroundTaskMessage(msg)) {
+    // Activity owns task lifecycle/status, including failures and stops. Keep
+    // the records for task details and trajectory, but do not turn internal
+    // wake-ups into conversation rows or split a contiguous tool activity run.
+    if (
+      msg.type === 'background_task' ||
+      (msg.type === 'system' && msg.backgroundContinueTaskIds !== undefined)
+    ) {
       continue
     }
 
@@ -1160,18 +1092,10 @@ export function buildRenderModel(
         flushGroup()
         items.push({ kind: 'message', message: msg })
       } else {
-        appendRootToolCall(msg)
+        appendRootToolCall(msg, toolResult)
       }
     } else if (msg.type === 'thinking') {
       appendThinking(msg)
-    } else if (msg.type === 'background_task' && msg.task.status === 'completed') {
-      // The activity panel already lists every background task — agent-like ones
-      // under SubAgents, the rest under Background Tasks — with live status and a
-      // way into the full run. A card here repeating a finished one just buries
-      // the conversation under status reports, and a long team session emits
-      // dozens. Anything that did NOT finish cleanly still gets a card: a failure
-      // or a stop changes what the turn means, and the panel can be closed.
-      continue
     } else {
       flushGroup()
       items.push({ kind: 'message', message: msg })
@@ -1258,7 +1182,6 @@ function isTurnResponseMessage(message: UIMessage) {
     message.type === 'assistant_text' ||
     message.type === 'tool_use' ||
     message.type === 'tool_result' ||
-    (message.type === 'background_task' && !isAgentBackgroundTaskMessage(message)) ||
     message.type === 'error' ||
     message.type === 'task_summary'
   )
@@ -1358,6 +1281,26 @@ export function getUnansweredTurnTargets(
 export function getLatestCompletedTurnTarget(messages: UIMessage[]): RewindTurnTarget | null {
   const completedTurns = getCompletedTurnTargets(messages)
   return completedTurns.length > 0 ? completedTurns[completedTurns.length - 1] ?? null : null
+}
+
+function rebindTurnChangeCards(cards: TurnChangeCardModel[], messages: UIMessage[]): TurnChangeCardModel[] {
+  if (cards.length === 0) return cards
+  const recordedRows = new Map<string, string>()
+  const liveRows = new Set<string>()
+  for (const message of messages) {
+    if (message.type !== 'user_text' || message.pending) continue
+    recordedRows.set(message.transcriptMessageId ?? message.id, message.id)
+    if (!message.transcriptMessageId) liveRows.add(message.id)
+  }
+  // 重连可能用落盘 ID 替换本地行；保留原绑定或按落盘 ID 重挂，不用序号或文案猜测。
+  const rebound = cards.flatMap((card) => {
+    const originalId = card.target.messageId
+    const messageId = recordedRows.get(card.checkpoint.target.targetUserMessageId) ??
+      (liveRows.has(originalId) ? originalId : undefined)
+    if (messageId === undefined) return []
+    return messageId === originalId ? [card] : [{ ...card, target: { ...card.target, messageId } }]
+  })
+  return rebound.length === cards.length && rebound.every((card, index) => card === cards[index]) ? cards : rebound
 }
 
 function buildTurnCardInsertionMap(
@@ -1649,6 +1592,7 @@ function MemoryEventCard({ message }: { message: MemoryEvent }) {
 
 type MessageListProps = {
   sessionId?: string | null
+  visible?: boolean
   compact?: boolean
   mobileLayout?: boolean
   /**
@@ -1707,20 +1651,7 @@ const CONVERSATION_NAVIGATION_COMPACT_MIN_WIDTH_PX = 560
 const STREAMING_ASSISTANT_NAVIGATION_KEY = 'streaming-assistant-message'
 const EMPTY_MESSAGES: UIMessage[] = []
 const EMPTY_AGENT_TASK_NOTIFICATIONS: Record<string, AgentTaskNotification> = {}
-const CHAT_SCROLL_AREA_CLASS = [
-  'chat-scroll-area',
-  '[scrollbar-width:auto]',
-  '[scrollbar-color:color-mix(in_srgb,var(--color-outline)_72%,transparent)_transparent]',
-  '[&::-webkit-scrollbar]:w-2.5',
-  '[&::-webkit-scrollbar-track]:bg-transparent',
-  '[&::-webkit-scrollbar-thumb]:rounded-full',
-  '[&::-webkit-scrollbar-thumb]:border-[3px]',
-  '[&::-webkit-scrollbar-thumb]:border-transparent',
-  '[&::-webkit-scrollbar-thumb]:bg-[color-mix(in_srgb,var(--color-outline)_74%,transparent)]',
-  '[&::-webkit-scrollbar-thumb]:bg-clip-content',
-  '[&::-webkit-scrollbar-thumb:hover]:border-2',
-  '[&::-webkit-scrollbar-thumb:hover]:bg-[color-mix(in_srgb,var(--color-outline)_90%,transparent)]',
-].join(' ')
+const CHAT_SCROLL_AREA_CLASS = 'chat-scroll-area topbar-scroll-fade scrollbar-autohide'
 const CHAT_RENDER_ITEM_CLASS = [
   'chat-render-item',
 ].join(' ')
@@ -2487,6 +2418,7 @@ const MeasuredRenderItem = memo(function MeasuredRenderItem({
 
 export function MessageList({
   sessionId,
+  visible = true,
   compact = false,
   mobileLayout = false,
   decisionsInComposer = false,
@@ -2503,6 +2435,9 @@ export function MessageList({
   )
   const sessionState = useChatStore((s) =>
     resolvedSessionId ? s.sessions[resolvedSessionId] : undefined,
+  )
+  const unreadCompletion = useChatStore((s) =>
+    resolvedSessionId ? s.unreadCompletions.get(resolvedSessionId) : undefined,
   )
   const branchSession = useSessionStore((s) => s.branchSession)
   const reloadHistory = useChatStore((s) => s.reloadHistory)
@@ -2549,7 +2484,8 @@ export function MessageList({
   }, [teamSnapshot])
   const addToast = useUIStore((s) => s.addToast)
   const messages = sessionState?.messages ?? EMPTY_MESSAGES
-  const checkpointHistoryReady = sessionState?.historyStatus === 'ready' && sessionState?.historyHydrated === true
+  const checkpointHistoryHydrated = sessionState?.historyHydrated === true
+  const checkpointHistoryReady = checkpointHistoryHydrated && sessionState?.historyStatus === 'ready'
   const chatState = sessionState?.chatState ?? 'idle'
   const isPreparingTurn = Boolean(sessionState?.isPreparingTurn)
   const historyMutationEpoch = sessionState?.historyMutationEpoch ?? 0
@@ -2625,31 +2561,12 @@ export function MessageList({
     streamingToolInput,
   })
   const t = useTranslation()
-  // Keep disclosure choices across virtualized row remounts and later turns.
+  // 展开状态按会话和落盘检查点保存，不随消息行 ID 变化。
   const [expandedChangeCards, setExpandedChangeCards] = useState<Record<string, boolean>>({})
-  const [turnChangeCards, setTurnChangeCards] = useState<TurnChangeCardModel[]>([])
-  // Read the latest history on open without invalidating every image row while
-  // the active response streams.
-  const getConversationImages = useCallback(() => resolvedSessionId ? resolveConversationImages(
-    useChatStore.getState().sessions[resolvedSessionId]?.messages ?? EMPTY_MESSAGES,
-    {
-      sessionId: resolvedSessionId,
-      baseUrl: getServerBaseUrl(),
-      workDir: useWorkspaceContentStore.getState().statusBySession[resolvedSessionId]?.workDir,
-      imageLabel: t('assistantOutputs.kind.image'),
-      changedFilesByTurnId: new Map(turnChangeCards.map((card) => [card.target.messageId, card.checkpoint.code.filesChanged])),
-    },
-  ) : [], [resolvedSessionId, t, turnChangeCards])
-  const [turnChangeLoadError, setTurnChangeLoadError] = useState<string | null>(null)
-  const [workspaceChangesFallback, setWorkspaceChangesFallback] = useState<{
-    sessionId: string
-    files: WorkspaceChangedFile[] | null
-  } | null>(null)
   const [turnActionErrors, setTurnActionErrors] = useState<Record<string, string>>({})
-  const [isLoadingTurnChangeCards, setIsLoadingTurnChangeCards] = useState(false)
   const [branchingMessageId, setBranchingMessageId] = useState<string | null>(null)
   const [rewindingTurnId, setRewindingTurnId] = useState<string | null>(null)
-  const [turnUndoConfirmTargetId, setTurnUndoConfirmTargetId] = useState<string | null>(null)
+  const [turnUndoConfirmTarget, setTurnUndoConfirmTarget] = useState<{ sessionId: string; checkpointId: string } | null>(null)
   const [isAwayFromLatest, setIsAwayFromLatest] = useState(false)
   const [virtualViewport, setVirtualViewport] = useState<VirtualViewport>({
     scrollTop: SCROLL_BOTTOM_SENTINEL,
@@ -3150,14 +3067,57 @@ export function MessageList({
     () => buildTurnCompletionByMessageId(deferredMessages, { turnActive: chatState !== 'idle' }),
     [deferredMessages, chatState],
   )
-  const latestCompletedTurnId =
-    completedTurnTargets.length > 0
-      ? completedTurnTargets[completedTurnTargets.length - 1]?.messageId ?? null
-      : null
-  const visibleTurnChangeCards = hasRunningBackgroundTasks ? EMPTY_TURN_CHANGE_CARDS : turnChangeCards
+  const latestTurnCompletionMessageId = useMemo(() => {
+    for (let i = renderItems.length - 1; i >= 0; i -= 1) {
+      const candidate = renderItems[i]
+      if (candidate?.kind === 'message' && turnCompletionByMessageId.has(candidate.message.id)) {
+        return candidate.message.id
+      }
+    }
+    return null
+  }, [renderItems, turnCompletionByMessageId])
+  const waitingForReconnect = sessionState?.connectionState === 'reconnecting' || sessionState?.awaitingReconnectSync === true
+  const turnCheckpointQueryPaused = !checkpointHistoryReady || isDirectAgentSession || turnInProgress ||
+    hasRunningBackgroundTasks || waitingForReconnect || sessionState?.awaitingStopIdle === true
+  const historyWindowed = sessionState?.historyWindowed === true
+  const turnTargetsCurrent = deferredMessages === messages
+  const checkpointRequest = useMemo(() => {
+    if (!resolvedSessionId || turnCheckpointQueryPaused || !turnTargetsCurrent || completedTurnTargets.length === 0) return null
+    return { sessionId: resolvedSessionId, historyMutationEpoch, historyWindowed, targets: completedTurnTargets }
+  }, [completedTurnTargets, historyMutationEpoch, historyWindowed, resolvedSessionId, turnCheckpointQueryPaused, turnTargetsCurrent])
+  const [checkpointResult, setCheckpointResult] = useState<({ request: NonNullable<typeof checkpointRequest> } & (
+    | { kind: 'ready'; cards: TurnChangeCardModel[] }
+    | { kind: 'over-budget'; files: WorkspaceChangedFile[] | null }
+    | { kind: 'error'; message: string }
+  )) | null>(null)
+  // 上次结果可以继续阅读；只有当前请求的结果才可以用于撤销。
+  const currentCheckpointResult = checkpointResult?.request === checkpointRequest ? checkpointResult : null
+  const turnUndoBlocked = currentCheckpointResult?.kind !== 'ready'
+  const turnChangeLoadError = currentCheckpointResult?.kind === 'error' ? currentCheckpointResult.message : null
+  const workspaceChangesFallback = currentCheckpointResult?.kind === 'over-budget' ? currentCheckpointResult : null
+  // 断线会重置 historyHydrated，但不会清空正在显示的行；沿用这些行的只读卡片。
+  const canRetainTurnCards = !isDirectAgentSession && (!turnTargetsCurrent || completedTurnTargets.length > 0)
+  const turnChangeCards = useMemo(() => {
+    if (!canRetainTurnCards || checkpointResult?.kind !== 'ready' || checkpointResult.request.sessionId !== resolvedSessionId) {
+      return EMPTY_TURN_CHANGE_CARDS
+    }
+    return turnTargetsCurrent && checkpointResult.request.targets === completedTurnTargets
+      ? checkpointResult.cards
+      : rebindTurnChangeCards(checkpointResult.cards, messages)
+  }, [canRetainTurnCards, checkpointResult, completedTurnTargets, messages, resolvedSessionId, turnTargetsCurrent])
+  const getConversationImages = useCallback(() => resolvedSessionId ? resolveConversationImages(
+    useChatStore.getState().sessions[resolvedSessionId]?.messages ?? EMPTY_MESSAGES,
+    {
+      sessionId: resolvedSessionId,
+      baseUrl: getServerBaseUrl(),
+      workDir: useWorkspaceContentStore.getState().statusBySession[resolvedSessionId]?.workDir,
+      imageLabel: t('assistantOutputs.kind.image'),
+      changedFilesByTurnId: new Map(turnChangeCards.map((card) => [card.target.messageId, card.checkpoint.code.filesChanged])),
+    },
+  ) : [], [resolvedSessionId, t, turnChangeCards])
   const turnCardsByRenderIndex = useMemo(
-    () => buildTurnCardInsertionMap(renderItems, visibleTurnChangeCards),
-    [renderItems, visibleTurnChangeCards],
+    () => buildTurnCardInsertionMap(renderItems, turnChangeCards),
+    [renderItems, turnChangeCards],
   )
   const changedFilesByRenderIndex = useMemo(
     () => buildChangedFilesByRenderIndex(renderItems, turnChangeCards),
@@ -3211,6 +3171,38 @@ export function MessageList({
   useLayoutEffect(() => {
     committedGroupKeys.current = { sessionId: resolvedSessionId, byTool: groupMountKeys.byTool }
   }, [groupMountKeys, resolvedSessionId])
+  const committedChangeCardRows = useRef<{
+    sessionId: typeof resolvedSessionId
+    hosts: Map<string, { itemKey: string; mountKey: string }>
+  }>({ sessionId: resolvedSessionId, hosts: new Map() })
+  const changeCardMounts = useMemo(() => {
+    const hosts = new Map<string, { itemKey: string; mountKey: string }>()
+    const aliases = new Map<string, string>()
+    if (turnCardsByRenderIndex.size === 0) return { hosts, aliases }
+    const previous = committedChangeCardRows.current
+    const used = new Set([...renderItemKeys, ...groupMountKeys.keys.values()])
+    for (const [index, cards] of turnCardsByRenderIndex) {
+      const item = renderItems[index]!
+      if (item.kind !== 'message' || item.message.type !== 'assistant_text') continue
+      const card = cards.find(card => card.checkpoint.code.available)
+      if (!card) continue
+      const checkpointId = card.checkpoint.target.targetUserMessageId
+      const itemKey = renderItemKeys[index]!
+      const prior = previous.sessionId === resolvedSessionId ? previous.hosts.get(checkpointId) : undefined
+      // 旧答复行已经被替换时，让同一检查点的卡片留在原 DOM，保住浏览器的滚动锚点。
+      const retained = prior && (prior.itemKey === itemKey || !used.has(prior.itemKey)) && !used.has(prior.mountKey)
+      const mountKey = retained ? prior.mountKey : itemKey
+      if (retained) {
+        used.add(mountKey)
+        aliases.set(itemKey, mountKey)
+      }
+      hosts.set(checkpointId, { itemKey, mountKey })
+    }
+    return { hosts, aliases }
+  }, [groupMountKeys, renderItemKeys, renderItems, resolvedSessionId, turnCardsByRenderIndex])
+  useLayoutEffect(() => {
+    committedChangeCardRows.current = { sessionId: resolvedSessionId, hosts: changeCardMounts.hosts }
+  }, [changeCardMounts, resolvedSessionId])
   const renderItemMetrics = useMemo(
     () => renderItems.map((item, index) => {
       const key = renderItemKeys[index]!
@@ -3292,6 +3284,43 @@ export function MessageList({
     ),
     [measuredItemsVersion, renderItemKeys, renderItemMetrics, renderItems, scrollAnchor, virtualItemHeights, virtualViewport],
   )
+
+  const unreadReplyId = useMemo(
+    () => visible && unreadCompletion ? resolveUnreadCompletion(messages, unreadCompletion)?.id : undefined,
+    [visible, messages, unreadCompletion],
+  )
+  useEffect(() => {
+    if (!unreadReplyId || !unreadCompletion || !resolvedSessionId || typeof IntersectionObserver === 'undefined') return
+    const reply = Array.from(scrollContentRef.current?.querySelectorAll<HTMLElement>('[data-chat-render-item-key]') ?? [])
+      .find(element => element.dataset.chatRenderItemKey === unreadReplyId)
+      ?.querySelector('[data-chat-selectable-message="assistant"]')
+    if (!reply) return
+
+    // Hidden tabs and the trajectory view keep their transcripts mounted. Only
+    // acknowledge a reply once its row enters the focused window's viewport.
+    let active = true
+    const observer = new IntersectionObserver(entries => {
+      const entry = entries[entries.length - 1]
+      if (active && entry?.isIntersecting && entry.intersectionRect.height > 0 && entry.intersectionRect.width > 0 &&
+        document.visibilityState === 'visible' && document.hasFocus()) {
+        useChatStore.getState().markSessionCompletionRead(resolvedSessionId, unreadCompletion)
+      }
+    }, { threshold: [0, 0.001] })
+    const observeAgain = () => {
+      observer.disconnect()
+      observer.takeRecords()
+      observer.observe(reply)
+    }
+    observer.observe(reply)
+    window.addEventListener('focus', observeAgain)
+    document.addEventListener('visibilitychange', observeAgain)
+    return () => {
+      active = false
+      observer.disconnect()
+      window.removeEventListener('focus', observeAgain)
+      document.removeEventListener('visibilitychange', observeAgain)
+    }
+  }, [unreadCompletion, unreadReplyId, resolvedSessionId, virtualTranscriptWindow.items])
 
   useLayoutEffect(() => {
     const anchor = restoringScrollAnchorRef.current
@@ -3404,9 +3433,14 @@ export function MessageList({
             ? 'px-7 py-4'
             : 'px-6 py-4'
   const confirmTurnCard = useMemo(
-    () => visibleTurnChangeCards.find((card) => card.target.messageId === turnUndoConfirmTargetId) ?? null,
-    [turnUndoConfirmTargetId, visibleTurnChangeCards],
+    () => turnUndoConfirmTarget?.sessionId === resolvedSessionId
+      ? turnChangeCards.find((card) => card.checkpoint.target.targetUserMessageId === turnUndoConfirmTarget?.checkpointId) ?? null
+      : null,
+    [resolvedSessionId, turnUndoConfirmTarget, turnChangeCards],
   )
+  useEffect(() => {
+    if (turnUndoConfirmTarget && !confirmTurnCard) setTurnUndoConfirmTarget(null)
+  }, [confirmTurnCard, turnUndoConfirmTarget])
   // Undo is not reversible, so the dialog — not just the card — has to say which
   // changes it will leave behind when the checkpoint could not cover them all.
   const confirmUnverifiedSources = confirmTurnCard?.checkpoint.unverifiedChangeSources ?? []
@@ -3452,99 +3486,63 @@ export function MessageList({
   }, [renderItemKeys, virtualItemHeights, virtualItemMetricCache])
 
   useEffect(() => {
-    if (!resolvedSessionId || !checkpointHistoryReady || completedTurnTargets.length === 0 || isDirectAgentSession) {
-      setTurnChangeCards([])
-      setTurnChangeLoadError(null)
-      setWorkspaceChangesFallback(null)
-      setIsLoadingTurnChangeCards(false)
+    if (!canRetainTurnCards) {
+      setCheckpointResult(null)
       return
     }
+    if (!checkpointRequest) return
 
-    if (hasRunningBackgroundTasks) {
-      setTurnChangeLoadError(null)
-      setWorkspaceChangesFallback(null)
-      setIsLoadingTurnChangeCards(false)
-      return
-    }
-
-    if (chatState !== 'idle') {
-      setTurnChangeLoadError(null)
-      setWorkspaceChangesFallback(null)
-      setIsLoadingTurnChangeCards(false)
-      return
-    }
-
-    let cancelled = false
+    const { sessionId, targets, historyWindowed } = checkpointRequest
     const controller = new AbortController()
-    setIsLoadingTurnChangeCards(true)
-    setTurnChangeLoadError(null)
-    setWorkspaceChangesFallback(null)
-
-    // Keep the bounded workspace evidence even if full turn previews exceed
-    // their budget. These files describe the current workspace, not a turn.
+    // 全量检查点超限时，有界的工作区状态仍可作为当前文件列表，但不归属任何回合。
     Promise.allSettled([
-      sessionsApi.getTurnCheckpoints(resolvedSessionId, { signal: controller.signal }),
-      sessionsApi.getWorkspaceStatus(resolvedSessionId, controller.signal),
+      sessionsApi.getTurnCheckpoints(sessionId, { signal: controller.signal }),
+      sessionsApi.getWorkspaceStatus(sessionId, controller.signal),
     ])
-      .then(([checkpointResult, workspaceResult]) => {
-        if (cancelled) return
-        const workspaceStatus = workspaceResult.status === 'fulfilled' ? workspaceResult.value : null
-        if (checkpointResult.status === 'rejected') {
-          setTurnChangeCards([])
-          if (isCheckpointPreviewBudgetError(checkpointResult.reason)) {
+      .then(([checkpointResponse, workspaceResponse]) => {
+        if (controller.signal.aborted) return
+        const workspaceStatus = workspaceResponse.status === 'fulfilled' ? workspaceResponse.value : null
+        if (checkpointResponse.status === 'rejected') {
+          if (isCheckpointPreviewBudgetError(checkpointResponse.reason)) {
             const files = workspaceStatus?.state === 'ok' &&
               Array.isArray(workspaceStatus.changedFiles) &&
               workspaceStatus.changedFiles.every((file) => typeof file?.path === 'string' && file.path.trim().length > 0)
               ? workspaceStatus.changedFiles
               : null
-            setWorkspaceChangesFallback({ sessionId: resolvedSessionId, files })
+            setCheckpointResult({ request: checkpointRequest, kind: 'over-budget', files })
           } else {
-            setTurnChangeLoadError(getApiErrorMessage(checkpointResult.reason))
+            setCheckpointResult({ request: checkpointRequest, kind: 'error', message: getApiErrorMessage(checkpointResponse.reason) })
           }
           return
         }
-        const targetByMessageId = new Map(
-          completedTurnTargets.map((target) => [target.messageId, target] as const),
-        )
-        const targetByUserMessageIndex = new Map(
-          completedTurnTargets.map((target) => [target.userMessageIndex, target] as const),
-        )
-
-        const nextCards = normalizeTurnCheckpoints(checkpointResult.value).flatMap((checkpoint) => {
-            const target =
-              targetByMessageId.get(checkpoint.target.targetUserMessageId) ??
-              (sessionState?.historyWindowed ? undefined : targetByUserMessageIndex.get(checkpoint.target.userMessageIndex))
-            if (!target) {
-              return []
-            }
-            return [{
-              target,
-              checkpoint,
-              workDir: checkpoint.workDir ?? workspaceStatus?.workDir ?? null,
-              isLatest: target.messageId === latestCompletedTurnId,
-            }]
-          })
-        setTurnChangeCards(nextCards)
+        const targetsById = new Map(targets.map((target) => [target.transcriptMessageId ?? target.messageId, target]))
+        const liveTargetsByIndex = new Map(targets
+          .filter((target) => !target.transcriptMessageId)
+          .map((target) => [target.userMessageIndex, target]))
+        const cards = normalizeTurnCheckpoints(checkpointResponse.value).flatMap((checkpoint) => {
+          const target = targetsById.get(checkpoint.target.targetUserMessageId) ??
+            (historyWindowed ? undefined : liveTargetsByIndex.get(checkpoint.target.userMessageIndex))
+          if (!target) return []
+          return [{
+            target,
+            checkpoint,
+            workDir: checkpoint.workDir ?? workspaceStatus?.workDir ?? null,
+            isLatest: target === targets.at(-1),
+          }]
+        })
+        setCheckpointResult({ request: checkpointRequest, kind: 'ready', cards })
       })
       .catch((error) => {
-        if (cancelled) return
-        setTurnChangeCards([])
-        setTurnChangeLoadError(getApiErrorMessage(error))
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setIsLoadingTurnChangeCards(false)
+        if (!controller.signal.aborted) {
+          setCheckpointResult({ request: checkpointRequest, kind: 'error', message: getApiErrorMessage(error) })
         }
       })
 
-    return () => {
-      cancelled = true
-      controller.abort()
-    }
-  }, [chatState, completedTurnTargets, hasRunningBackgroundTasks, historyMutationEpoch, isDirectAgentSession, latestCompletedTurnId, resolvedSessionId, checkpointHistoryReady])
+    return () => controller.abort()
+  }, [canRetainTurnCards, checkpointRequest])
 
   const handleUndoCurrentTurn = useCallback(async (mode: SessionRewindMode = 'both') => {
-    if (!resolvedSessionId || !confirmTurnCard || rewindingTurnId || hasRunningBackgroundTasks) return
+    if (!resolvedSessionId || !confirmTurnCard || rewindingTurnId || turnUndoBlocked) return
 
     const target = confirmTurnCard.target
     setRewindingTurnId(target.messageId)
@@ -3568,25 +3566,25 @@ export function MessageList({
       })
       addToast(describeRewindResult(result, mode, t))
 
-      setTurnUndoConfirmTargetId(null)
+      setTurnUndoConfirmTarget(null)
     } catch (error) {
       setTurnActionErrors((current) => ({
         ...current,
         [target.messageId]: getApiErrorMessage(error),
       }))
-      setTurnUndoConfirmTargetId(null)
+      setTurnUndoConfirmTarget(null)
     } finally {
       setRewindingTurnId(null)
     }
   }, [
     addToast,
     confirmTurnCard,
-    hasRunningBackgroundTasks,
     queueComposerPrefill,
     reloadHistory,
     resolvedSessionId,
     rewindingTurnId,
     t,
+    turnUndoBlocked,
   ])
 
   // Rolling the conversation back never depends on the checkpoint, so it stays
@@ -3595,13 +3593,14 @@ export function MessageList({
   const confirmActions: ActionDialogAction[] = [
     {
       label: t('common.cancel'),
-      onClick: () => setTurnUndoConfirmTargetId(null),
+      onClick: () => setTurnUndoConfirmTarget(null),
       variant: 'secondary',
     },
     {
       label: t('chat.turnChangesUndoConversationOnly'),
       onClick: () => { void handleUndoCurrentTurn('conversation') },
       variant: confirmCanRestoreCode ? 'secondary' : 'danger',
+      disabled: turnUndoBlocked,
       loading: Boolean(rewindingTurnId),
     },
     ...(confirmCanRestoreCode
@@ -3611,6 +3610,7 @@ export function MessageList({
             : t('chat.turnChangesHistoricalConfirmUndo'),
           onClick: () => { void handleUndoCurrentTurn('both') },
           variant: 'danger' as const,
+          disabled: turnUndoBlocked,
           loading: Boolean(rewindingTurnId),
         }]
       : []),
@@ -3665,15 +3665,15 @@ export function MessageList({
     () => getUnansweredTurnTargets(deferredMessages),
     [deferredMessages],
   )
-  const checkpointPreviewOverBudget = workspaceChangesFallback !== null &&
-    workspaceChangesFallback.sessionId === resolvedSessionId
+  const checkpointPreviewOverBudget = workspaceChangesFallback !== null
   // Past the preview budget the server lists no checkpoints at all, but one
   // rewind still resolves a prompt by its transcript id, so those prompts stay
   // editable. This mode tells the user file undo is unavailable, so the edit
   // rolls back the conversation only.
   const completedEditCards = useMemo<EditableTurnCard[]>(
-    () => checkpointPreviewOverBudget
-      ? completedTurnTargets.flatMap((target) => target.transcriptMessageId
+    () => {
+      if (!checkpointPreviewOverBudget) return turnUndoBlocked ? EMPTY_TURN_CHANGE_CARDS : turnChangeCards
+      return completedTurnTargets.flatMap((target) => target.transcriptMessageId
         ? [{
             target: { messageId: target.messageId, expectedContent: target.expectedContent },
             checkpoint: {
@@ -3682,8 +3682,8 @@ export function MessageList({
             conversationOnly: true,
           }]
         : [])
-      : visibleTurnChangeCards,
-    [checkpointPreviewOverBudget, completedTurnTargets, visibleTurnChangeCards],
+    },
+    [checkpointPreviewOverBudget, completedTurnTargets, turnChangeCards, turnUndoBlocked],
   )
   // A prompt stopped before any reply has no checkpoint but nothing to restore
   // either, so it rewinds the conversation only. One the CLI never
@@ -3715,7 +3715,7 @@ export function MessageList({
     : hasRunningBackgroundTasks
       ? t('chat.editMessageWaitForBackgroundTasks')
       : null
-  const editPendingReason = !checkpointHistoryReady || isLoadingTurnChangeCards
+  const editPendingReason = !currentCheckpointResult
     ? t('chat.editMessageCheckingCheckpoints')
     : turnChangeLoadError !== null
       ? t('chat.editMessageCheckpointsUnavailable')
@@ -3728,7 +3728,7 @@ export function MessageList({
     completedMessageIds: completedTurnMessageIds,
     blockedReason: editBlockedReason,
     pendingReason: editPendingReason,
-    disabled: isDirectAgentSession || isSideChatSession || Boolean(turnUndoConfirmTargetId),
+    disabled: isDirectAgentSession || isSideChatSession || Boolean(confirmTurnCard),
     rewindingTurnId,
     setRewindingTurnId,
     t,
@@ -4118,6 +4118,15 @@ export function MessageList({
               turnOutputEvidence={changedFilesByRenderIndex.get(index) ?? (turnEvidenceUnavailable ? UNKNOWN_TURN_OUTPUT_EVIDENCE : undefined)}
               isTurnOutputOwner={turnOutputOwnerIndexes.has(index)}
               turnCompletion={turnCompletionByMessageId.get(item.message.id)}
+              isLatestTurn={item.message.id === latestTurnCompletionMessageId}
+              consecutiveUserBefore={
+                item.message.type === 'user_text' && !item.message.teammateFrom && !item.message.scheduledTask
+                && isPlainUserRenderItem(renderItems[index - 1])
+              }
+              consecutiveUserAfter={
+                item.message.type === 'user_text' && !item.message.teammateFrom && !item.message.scheduledTask
+                && isPlainUserRenderItem(renderItems[index + 1])
+              }
               supersededAskUserQuestionIds={supersededAskUserQuestionIds}
               decisionsInComposer={decisionsInComposer}
               navigationHighlighted={
@@ -4130,20 +4139,23 @@ export function MessageList({
 
 
         {resolvedSessionId && cardsForItem.map((card) => {
+          const checkpointId = card.checkpoint.target.targetUserMessageId
+          const disclosureKey = JSON.stringify([resolvedSessionId, checkpointId])
           const error = turnActionErrors[card.target.messageId] ?? null
           const openUndoDialog = () => {
-            setTurnUndoConfirmTargetId(card.target.messageId)
+            if (!turnUndoBlocked) setTurnUndoConfirmTarget({ sessionId: resolvedSessionId, checkpointId })
           }
           if (!card.checkpoint.code.available) {
             return (
               <div
-                key={`conversation-rewind-${card.target.messageId}`}
+                key={`conversation-rewind-${checkpointId}`}
                 className="mt-1 flex flex-wrap items-center gap-2 px-1"
               >
                 <Button
                   variant="ghost"
                   size="sm"
                   loading={rewindingTurnId === card.target.messageId}
+                  disabled={turnUndoBlocked}
                   onClick={openUndoDialog}
                   icon={<Undo2 size={13} strokeWidth={2} aria-hidden="true" />}
                 >
@@ -4159,17 +4171,18 @@ export function MessageList({
           }
           return (
             <CurrentTurnChangeCard
-              key={`turn-change-${card.target.messageId}`}
+              key={`turn-change-${checkpointId}`}
               sessionId={resolvedSessionId}
-              expanded={expandedChangeCards[`${resolvedSessionId}:${card.target.messageId}`] ?? false}
+              expanded={expandedChangeCards[disclosureKey] ?? false}
               onExpandedChange={(expanded) => setExpandedChangeCards((current) => ({
                 ...current,
-                [`${resolvedSessionId}:${card.target.messageId}`]: expanded,
+                [disclosureKey]: expanded,
               }))}
               checkpoint={card.checkpoint}
               workDir={card.workDir}
               error={error}
               isUndoing={rewindingTurnId === card.target.messageId}
+              undoDisabled={turnUndoBlocked}
               isLatest={card.isLatest}
               onUndo={openUndoDialog}
             />
@@ -4242,7 +4255,7 @@ export function MessageList({
 
           {virtualTranscriptWindow.items.map(({ item, index }) => {
             const itemKey = getRenderItemKey(item)
-            const mountKey = groupMountKeys.keys.get(itemKey) ?? itemKey
+            const mountKey = changeCardMounts.aliases.get(itemKey) ?? groupMountKeys.keys.get(itemKey) ?? itemKey
             const content = renderTranscriptItem(item, index)
             const railPosition = turnRailPositions[index] ?? 'none'
             // The prompt editor opens its slash and @ menus upward, past the
@@ -4304,17 +4317,16 @@ export function MessageList({
             </div>
           )}
 
-          {!isLoadingTurnChangeCards && visibleTurnChangeCards.length === 0 && turnChangeLoadError && (
+          {turnChangeLoadError && (
             <div className="mx-auto mb-5 w-full max-w-[var(--chat-content-max-width)] rounded-[var(--radius-md)] bg-[var(--color-error-container)] px-3.5 py-2.5 text-xs text-[var(--color-on-error-container)]">
               {turnChangeLoadError}
             </div>
           )}
 
-          {!isLoadingTurnChangeCards && chatState === 'idle' && !hasRunningBackgroundTasks &&
-            workspaceChangesFallback?.sessionId === resolvedSessionId ? (
+          {workspaceChangesFallback ? (
               <WorkspaceChangesFallback
-                key={workspaceChangesFallback.sessionId}
-                sessionId={workspaceChangesFallback.sessionId}
+                key={workspaceChangesFallback.request.sessionId}
+                sessionId={workspaceChangesFallback.request.sessionId}
                 files={workspaceChangesFallback.files}
               />
             ) : null}
@@ -4339,9 +4351,9 @@ export function MessageList({
           onClick={handleJumpToLatest}
           title={t('chat.jumpToLatest')}
           aria-label={t('chat.jumpToLatest')}
-          // `glass-panel` is unlayered CSS, so it wins over the variant's
+          // `surface-glass` is unlayered CSS, so it wins over the variant's
           // layered background/border utilities without a tailwind-merge.
-          className="glass-panel absolute bottom-4 right-5 z-20 rounded-full text-[13px] font-medium hover:-translate-y-px motion-reduce:hover:translate-y-0"
+          className="surface-glass popover-motion absolute bottom-4 right-5 z-20 rounded-full text-[13px] font-medium shadow-[var(--shadow-dropdown-glass)] hover:-translate-y-px motion-reduce:hover:translate-y-0"
           icon={<ArrowDown size={15} aria-hidden="true" />}
         >
           {t('chat.jumpToLatest')}
@@ -4352,7 +4364,7 @@ export function MessageList({
         open={Boolean(confirmTurnCard)}
         onClose={() => {
           if (!rewindingTurnId) {
-            setTurnUndoConfirmTargetId(null)
+            setTurnUndoConfirmTarget(null)
           }
         }}
         title={confirmTurnCard?.isLatest
@@ -4378,6 +4390,16 @@ export function MessageList({
   )
 }
 
+function isPlainUserRenderItem(item: RenderItem | undefined): boolean {
+  return Boolean(
+    item &&
+    item.kind === 'message' &&
+    item.message.type === 'user_text' &&
+    !item.message.teammateFrom &&
+    !item.message.scheduledTask,
+  )
+}
+
 export const MessageBlock = memo(function MessageBlock({
   sessionId,
   message,
@@ -4391,6 +4413,9 @@ export const MessageBlock = memo(function MessageBlock({
   turnOutputEvidence,
   isTurnOutputOwner,
   turnCompletion,
+  isLatestTurn = true,
+  consecutiveUserBefore = false,
+  consecutiveUserAfter = false,
   supersededAskUserQuestionIds,
   decisionsInComposer = false,
   navigationHighlighted = false,
@@ -4411,6 +4436,9 @@ export const MessageBlock = memo(function MessageBlock({
   turnOutputEvidence?: TurnOutputEvidence
   isTurnOutputOwner?: boolean
   turnCompletion?: TurnCompletion
+  isLatestTurn?: boolean
+  consecutiveUserBefore?: boolean
+  consecutiveUserAfter?: boolean
   supersededAskUserQuestionIds?: ReadonlySet<string>
   decisionsInComposer?: boolean
   /** A "locate in chat" jump landed on this tool call. */
@@ -4454,6 +4482,8 @@ export const MessageBlock = memo(function MessageBlock({
             teammateAvatarSrc={teammateVisual?.avatarSrc}
             teammateAvatarKey={teammateVisual?.avatarKey}
             teammateAccent={teammateVisual?.accent}
+            consecutiveBefore={consecutiveUserBefore}
+            consecutiveAfter={consecutiveUserAfter}
           />
         </SelectableChatMessage>
       )
@@ -4473,6 +4503,7 @@ export const MessageBlock = memo(function MessageBlock({
             turnOutputEvidence={turnOutputEvidence}
             isTurnOutputOwner={isTurnOutputOwner}
             turnCompletion={turnCompletion}
+            isLatestTurn={isLatestTurn}
           />
           {isCliApiErrorText(message.content) && (
             <MagpieConnectionHint sessionId={sessionId} errorText={message.content} />
@@ -4585,7 +4616,7 @@ export const MessageBlock = memo(function MessageBlock({
         ? <GoalContinuationDivider message={message} />
         : <GoalEventCard message={message} />
     case 'background_task':
-      return <BackgroundTaskEventCard message={message} />
+      return null
     case 'system':
       return (
         <div className="mb-3 text-center text-xs text-[var(--color-text-tertiary)]">

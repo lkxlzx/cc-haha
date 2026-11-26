@@ -56,6 +56,13 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@/lib/workspace/openSideChat', () => ({ openSideChat: mocks.sideOpen }))
 
+vi.mock('@/api/promptHistory', () => ({
+  promptHistoryApi: {
+    list: vi.fn(async () => ({ entries: [] })),
+    append: vi.fn(async () => ({ ok: true })),
+  },
+}))
+
 vi.mock('../../api/sessions', () => ({
   sessionsApi: {
     create: mocks.create,
@@ -63,6 +70,7 @@ vi.mock('../../api/sessions', () => ({
     list: mocks.list,
     getMessages: mocks.getMessages,
     getGitInfo: mocks.getGitInfo,
+    invalidateGitInfo: vi.fn(),
     getSlashCommands: mocks.getSlashCommands,
     getRepositoryContext: mocks.getRepositoryContext,
     createRepositoryBranch: mocks.createRepositoryBranch,
@@ -154,6 +162,7 @@ vi.mock('../controls/ModelSelector', async () => {
 })
 
 import { ChatInput } from './ChatInput'
+import { clearComposerPromptHistoryCacheForTesting } from '@/hooks/useComposerPromptHistory'
 import { getComposerElement, getComposerText, getComposerView, setComposerSelection, setComposerText } from './composerTestUtils'
 import { useVoiceInputStore } from '../../stores/voiceInputStore'
 import { useChatStore, type RepositoryLaunchDraftState } from '../../stores/chatStore'
@@ -256,6 +265,7 @@ describe('ChatInput file mentions', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    clearComposerPromptHistoryCacheForTesting()
     localStorage.removeItem(RECENT_SKILLS_STORAGE_KEY)
     localStorage.removeItem(AGENT_TEAMS_NOTICE_STORAGE_KEY)
     useSideChatStore.setState({ entries: {} })
@@ -1017,12 +1027,11 @@ describe('ChatInput file mentions', () => {
     expect(modeSheet).toHaveTextContent('Unavailable')
   })
 
-  // On desktop the lean badge and its info button used to share the row with
-  // the project, branch and model, and the row wrapped its trailing group onto a
-  // second line to make room, which left the first line's right half empty.
-  // The lean mode is a chip in the leading group now, so the row never wraps.
-  // jsdom lays nothing out; this pins the pieces that keep that from coming back.
-  it.each([false, true])('keeps the desktop toolbar to one row, the leading group giving way (lean session %s)', (lean) => {
+  // On desktop the run location lives in the bare under-card context strip, so
+  // the leading group stays `shrink-0` (protecting "+" from ever colliding with
+  // trailing controls in narrow split-pane columns) while the trailing group
+  // (`min-w-0 flex-1`) gives up model-name width cleanly without wrapping.
+  it.each([false, true])('keeps the desktop toolbar to one row without crushing the leading controls (lean session %s)', (lean) => {
     stubComposerColumnWidth(640)
     if (lean) useSessionStore.setState(state => ({ sessions: state.sessions.map(session => ({ ...session, agentProfile: 'lean' as const })) }))
     render(<ChatInput compact />)
@@ -1031,8 +1040,8 @@ describe('ChatInput file mentions', () => {
     const trailing = screen.getByTestId('chat-input-toolbar-trailing')
 
     expect(toolbar).not.toHaveClass('flex-wrap')
-    expect(leading).toHaveClass('min-w-0', 'shrink')
-    expect(trailing).toHaveClass('shrink-0')
+    expect(leading).toHaveClass('shrink-0')
+    expect(trailing).toHaveClass('min-w-0', 'flex-1')
     expect(trailing).not.toHaveClass('min-w-max')
     expect(trailing).toContainElement(screen.getByTestId('model-selector-shell'))
     expect(screen.queryByTestId('agent-profile-control')).not.toBeInTheDocument()
@@ -1496,16 +1505,18 @@ describe('ChatInput file mentions', () => {
     render(<ChatInput variant="hero" />)
 
     const panel = screen.getByTestId('chat-input-panel')
-    // The floating card (「素」): `--radius-xl` + the composer step of the
-    // shadow scale, the same shell EmptySession renders.
-    expect(panel).toHaveClass('rounded-[var(--radius-xl)]', 'glass-panel--composer')
+    // Floating frosted-glass composer shell: `.composer-glass` + `--radius-2xl`.
+    expect(panel).toHaveClass('rounded-[var(--radius-2xl)]', 'composer-glass')
     expect(panel).not.toHaveClass('rounded-b-none')
 
-    // One pill in the toolbar instead of a three-button bar welded to the
-    // panel's bottom edge — which is what used to square off that edge.
+    // Repository launch pill lives in the bare under-card strip cleanly below
+    // the rounded composer card without overlapping its bottom corners.
+    const strip = screen.getByTestId('composer-context-strip')
+    expect(strip).toHaveClass('surface-glass', 'pt-2')
+    expect(strip).not.toHaveClass('composer-seam-below', '-mt-4')
     const pill = await screen.findByRole('button', { name: 'Location: repo / main' })
-    expect(panel).toContainElement(pill)
-    // A 28px toolbar control like its neighbours, not a bordered pill.
+    expect(strip).toContainElement(pill)
+    expect(panel).not.toContainElement(pill)
     expect(pill).toHaveClass('h-7')
     expect(screen.queryByText('Select a project...')).not.toBeInTheDocument()
 
@@ -1524,18 +1535,107 @@ describe('ChatInput file mentions', () => {
   // composer only while the session is empty, so a live session is always the
   // default one. Asserting this against `hero` passed while the shipped
   // composer still dropped the chip below the panel.
-  it('swaps the pill for a read-only chip in the same row once the session has messages', async () => {
+  it('swaps the pill for a read-only chip in the bare under-card strip once the session has messages', async () => {
     // beforeEach seeds one message, so this is a live session, not a draft.
     render(<ChatInput variant="default" />)
 
+    const strip = screen.getByTestId('composer-context-strip')
+    expect(strip).toHaveClass('surface-glass', 'pt-2')
+    expect(strip).not.toHaveClass('composer-seam-below', '-mt-4')
     const chip = await screen.findByTestId('run-location-readonly')
     expect(chip).toHaveTextContent('repo')
     expect(chip).toHaveTextContent('main')
 
-    expect(screen.getByTestId('chat-input-toolbar')).toContainElement(chip)
-    expect(screen.getByTestId('chat-input-panel')).toContainElement(chip)
+    expect(strip).toContainElement(chip)
+    expect(screen.getByTestId('chat-input-toolbar')).not.toContainElement(chip)
+    expect(screen.getByTestId('chat-input-panel')).not.toContainElement(chip)
     expect(screen.queryByTestId('run-location-outside')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /^Location/ })).not.toBeInTheDocument()
+  })
+
+  it('refreshes the composer worktree after a cwd notification and ignores an older Git response', async () => {
+    const oldInfo = { branch: 'main', repoName: 'repo', workDir: '/repo', changedFiles: 0, worktree: null }
+    let resolveOld!: (info: typeof oldInfo) => void
+    const oldRequest = new Promise<typeof oldInfo>(resolve => { resolveOld = resolve })
+    mocks.getGitInfo.mockReturnValue(oldRequest)
+    render(<ChatInput />)
+    await waitFor(() => expect(mocks.getGitInfo).toHaveBeenCalledWith(sessionId))
+    const worktreePath = '/repo/.claude/worktrees/entered'
+    mocks.getGitInfo.mockResolvedValue({ ...oldInfo, workDir: worktreePath,
+      worktree: { enabled: true, path: worktreePath, plannedPath: null, sourceWorkDir: '/repo', slug: 'entered', branch: 'worktree-entered' },
+    })
+    act(() => useSessionStore.getState().updateSessionWorkDir(sessionId, worktreePath))
+    expect(await screen.findByTestId('worktree-details-trigger')).toBeInTheDocument()
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); resolveOld(oldInfo); await oldRequest })
+    expect(screen.getByTestId('worktree-details-trigger')).toBeInTheDocument()
+    fireEvent.mouseEnter(screen.getByTestId('worktree-details-trigger'))
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(worktreePath)
+  })
+
+  it('refreshes the composer branch chip on window focus, visibility return, and focus returning from the terminal', async () => {
+    let currentBranch = 'master'
+    mocks.getGitInfo.mockImplementation(async () => ({
+      branch: currentBranch,
+      repoName: 'repo',
+      workDir: '/repo',
+      changedFiles: 0,
+      worktree: null,
+    }))
+
+    const { rerender } = render(
+      <div>
+        <button data-testid="prior-tab-button" type="button">Tab</button>
+        <textarea data-testid="docked-terminal-input" aria-label="Terminal" />
+        <ChatInput visible />
+      </div>,
+    )
+
+    expect(await screen.findByTestId('run-location-readonly')).toHaveTextContent('master')
+    // Programmatic mount auto-focus does not trigger a back-to-back duplicate /git-info fetch.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    expect(mocks.getGitInfo).toHaveBeenCalledTimes(1)
+
+    currentBranch = 'dev_xxxx'
+    act(() => {
+      window.dispatchEvent(new Event('focus'))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('run-location-readonly')).toHaveTextContent('dev_xxxx')
+    })
+
+    // Switching branches in the docked bottom terminal and focusing back into the composer refreshes the chip.
+    const terminalInput = screen.getByTestId('docked-terminal-input')
+    fireEvent.focus(terminalInput)
+    currentBranch = 'feat/from-terminal'
+    fireEvent.focus(getComposerElement(), { relatedTarget: terminalInput })
+    await waitFor(() => {
+      expect(screen.getByTestId('run-location-readonly')).toHaveTextContent('feat/from-terminal')
+    })
+
+    // Returning from a hidden state (e.g. Trajectory view) also refreshes the live branch once.
+    rerender(
+      <div>
+        <button data-testid="prior-tab-button" type="button">Tab</button>
+        <textarea data-testid="docked-terminal-input" aria-label="Terminal" />
+        <ChatInput visible={false} />
+      </div>,
+    )
+    screen.getByTestId('prior-tab-button').focus()
+    currentBranch = 'hotfix/after-trajectory'
+    const callsBeforeVisibleReturn = mocks.getGitInfo.mock.calls.length
+    rerender(
+      <div>
+        <button data-testid="prior-tab-button" type="button">Tab</button>
+        <textarea data-testid="docked-terminal-input" aria-label="Terminal" />
+        <ChatInput visible />
+      </div>,
+    )
+    await waitFor(() => {
+      expect(screen.getByTestId('run-location-readonly')).toHaveTextContent('hotfix/after-trajectory')
+    })
+    expect(mocks.getGitInfo).toHaveBeenCalledTimes(callsBeforeVisibleReturn + 1)
   })
 
   it('reactively uses the active session project root display name while retaining the active worktree path in context', async () => {
@@ -1615,13 +1715,13 @@ describe('ChatInput file mentions', () => {
   // permission mode to a bare icon even on a column with room to spare — the
   // panel is resizable and the window is not fixed, so its open state says
   // nothing about the width the composer actually got.
-  it('keeps the run location in the toolbar when a workspace panel leaves the column wide', async () => {
+  it('keeps the full read-only location in the under-card strip when a workspace panel leaves the column wide', async () => {
     stubComposerColumnWidth(580)
 
     render(<ChatInput compact />)
 
     const chip = await screen.findByTestId('run-location-readonly')
-    expect(screen.getByTestId('chat-input-toolbar')).toContainElement(chip)
+    expect(screen.getByTestId('composer-context-strip')).toContainElement(chip)
     expect(screen.queryByTestId('run-location-outside')).not.toBeInTheDocument()
 
     // The same width buys back the labelled permission pill.
@@ -2345,6 +2445,102 @@ describe('ChatInput file mentions', () => {
       await waitFor(() => {
         expect(useChatStore.getState().sessions[sessionId]?.repositoryLaunchDraft?.branch).toBe(expected)
       })
+    })
+
+    it('replaces the empty session to switch back to an explicitly chosen branch when the checkout moved externally without a focus event', async () => {
+      let liveGitBranch = 'main'
+      mocks.getGitInfo.mockImplementation(async () => ({
+        branch: liveGitBranch,
+        repoName: 'repo',
+        workDir: '/repo',
+        changedFiles: 0,
+        worktree: null,
+      }))
+      mocks.create.mockResolvedValueOnce({ sessionId: 'created-explicit-branch', workDir: '/repo' })
+      seedEmptySession({ workDir: '/repo', branch: 'main', useWorktree: false, branchAutomatic: false })
+      render(<ChatInput variant="hero" />)
+
+      expect(await screen.findByRole('button', { name: 'Location: repo / main' })).toBeInTheDocument()
+
+      // Checkout moves to dev_xxxx while the composer never lost focus (so gitInfo in state is still 'main').
+      liveGitBranch = 'dev_xxxx'
+      setComposerText('edit on main only', 17)
+      fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+
+      await waitFor(() => {
+        expect(mocks.create).toHaveBeenCalledWith({
+          workDir: '/repo',
+          repository: { branch: 'main', worktree: false },
+        })
+      })
+      expect(mocks.wsSend).toHaveBeenCalledWith('created-explicit-branch', {
+        type: 'user_message',
+        content: 'edit on main only',
+        attachments: [],
+      })
+    })
+
+    it('refreshes the empty-session launch branch pill when focus returns from the docked terminal', async () => {
+      let liveBranch = 'main'
+      mocks.getGitInfo.mockImplementation(async () => ({
+        branch: liveBranch,
+        repoName: 'repo',
+        workDir: '/repo',
+        changedFiles: 0,
+        worktree: null,
+      }))
+      seedEmptySession()
+
+      render(
+        <div>
+          <textarea data-testid="docked-terminal-input" aria-label="Terminal" />
+          <ChatInput variant="hero" visible />
+        </div>,
+      )
+
+      expect(await screen.findByRole('button', { name: 'Location: repo / main' })).toBeInTheDocument()
+
+      const terminalInput = screen.getByTestId('docked-terminal-input')
+      fireEvent.focus(terminalInput)
+      liveBranch = 'feature/a'
+      mocks.getRepositoryContext.mockResolvedValue(movedToFeatureA())
+      fireEvent.focus(getComposerElement(), { relatedTarget: terminalInput })
+
+      expect(await screen.findByRole('button', { name: 'Location: repo / feature/a' })).toBeInTheDocument()
+      expect(useChatStore.getState().sessions[sessionId]?.repositoryLaunchDraft).toMatchObject({
+        branch: 'feature/a',
+        branchAutomatic: true,
+      })
+    })
+
+    it('sends directly without replacing the empty session when an automatic branch moved externally on disk', async () => {
+      let liveGitBranch = 'main'
+      mocks.getGitInfo.mockImplementation(async () => ({
+        branch: liveGitBranch,
+        repoName: 'repo',
+        workDir: '/repo',
+        changedFiles: 0,
+        worktree: null,
+      }))
+      seedEmptySession()
+      render(<ChatInput variant="hero" />)
+
+      expect(await screen.findByRole('button', { name: 'Location: repo / main' })).toBeInTheDocument()
+
+      // Checkout moves on disk without a focus event: both repository-context and git-info now report feature/a.
+      liveGitBranch = 'feature/a'
+      mocks.getRepositoryContext.mockResolvedValue(movedToFeatureA())
+      setComposerText('run in current checkout', 23)
+      fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+
+      await waitFor(() => {
+        expect(mocks.wsSend).toHaveBeenCalledWith(sessionId, {
+          type: 'user_message',
+          content: 'run in current checkout',
+          attachments: [],
+        })
+      })
+      expect(mocks.create).not.toHaveBeenCalled()
     })
   })
 
@@ -3431,15 +3627,13 @@ describe('ChatInput file mentions', () => {
     expect(panel).not.toHaveClass('overflow-hidden')
   })
 
-  it.each([320, 400, 529, 530, 640])('keeps the toolbar actions at their width and lets the leading group give way in a %ipx desktop column', (width) => {
+  it.each([320, 400, 529, 530, 640])('protects leading "+" and lets trailing controls flex cleanly in a %ipx desktop column', (width) => {
     stubComposerColumnWidth(width)
     render(<ChatInput compact />)
-    expect(screen.getByTestId('chat-input-toolbar-leading')).toHaveClass('min-w-0', 'shrink')
-    if (width >= 530) {
-      expect(screen.getByTestId('chat-input-toolbar-location')).toHaveClass('min-w-0', 'flex-1')
-    }
-    expect(screen.getByTestId('chat-input-toolbar-trailing')).toHaveClass('shrink-0', 'justify-end')
-    expect(screen.getByTestId('model-selector-shell')).toHaveClass('shrink-0')
+    expect(screen.getByTestId('chat-input-toolbar-leading')).toHaveClass('shrink-0')
+    expect(screen.getByTestId('composer-context-strip')).toHaveClass('surface-glass', 'pt-2')
+    expect(screen.getByTestId('composer-context-strip')).not.toHaveClass('composer-seam-below', '-mt-4')
+    expect(screen.getByTestId('chat-input-toolbar-trailing')).toHaveClass('min-w-0', 'flex-1', 'justify-end')
     expect(screen.getByRole('button', { name: 'Run' })).toHaveClass('shrink-0')
   })
 
@@ -3471,8 +3665,8 @@ describe('ChatInput file mentions', () => {
     // The phone branch used to swap it for a `shadow-[…]` utility, which loses
     // to `.glass-panel`'s own `box-shadow` on stylesheet order — so the phone
     // composer silently rendered the floating-overlay shadow instead.
-    expect(screen.getByTestId('chat-input-panel')).toHaveClass('glass-panel--composer')
-    expect(screen.getByTestId('chat-input-panel')).toHaveClass('rounded-[var(--radius-xl)]')
+    expect(screen.getByTestId('chat-input-panel')).toHaveClass('composer-glass')
+    expect(screen.getByTestId('chat-input-panel')).toHaveClass('rounded-[var(--radius-2xl)]')
     expect(screen.getByTestId('chat-input-panel')).not.toHaveClass('rounded-b-none')
     expect(screen.getByTestId('chat-input-toolbar-leading')).toHaveClass('shrink-0', 'gap-1')
     expect(screen.getByTestId('chat-input-toolbar-trailing')).toHaveClass('min-w-0', 'flex-1', 'justify-end', 'gap-1')
@@ -4370,6 +4564,37 @@ describe('ChatInput file mentions', () => {
 
       expect(activeRecording.cancel).toHaveBeenCalledTimes(1)
     })
+  })
+
+  it('docks queued messages as a top seam banner and morphs the circular CTA when drafting mid-turn', async () => {
+    useChatStore.setState({
+      sessions: {
+        [sessionId]: {
+          ...useChatStore.getState().sessions[sessionId]!,
+          chatState: 'streaming',
+        },
+      },
+    })
+
+    render(<ChatInput />)
+
+    // Empty draft while streaming: single Stop circle.
+    const stopOnly = screen.getByRole('button', { name: 'Stop' })
+    expect(stopOnly).toHaveClass('control-bevel-cta', 'h-8', 'w-8', 'rounded-full')
+    expect(screen.queryByRole('button', { name: 'Run' })).not.toBeInTheDocument()
+
+    // Typing mid-turn exposes the circular Queue/Send CTA beside Stop.
+    setComposerText('follow-up steer', 15)
+    const queueBtn = screen.getByRole('button', { name: 'Run' })
+    expect(queueBtn).toHaveClass('control-bevel-cta', 'h-8', 'w-8', 'rounded-full')
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument()
+
+    // Clicking Queue docks the message into the top `.composer-seam-above` banner outside the panel.
+    fireEvent.click(queueBtn)
+    const banner = await screen.findByTestId('pending-user-message-list')
+    expect(banner).toHaveClass('surface-glass', 'composer-seam-above', 'rounded-t-[var(--radius-2xl)]')
+    expect(screen.getByTestId('chat-input-panel')).not.toContainElement(banner)
+    expect(banner).toHaveTextContent('follow-up steer')
   })
 
 })

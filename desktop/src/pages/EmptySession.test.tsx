@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   getMessages: vi.fn(),
   getSlashCommands: vi.fn(),
   listSkills: vi.fn(),
+  listSkillCommands: vi.fn(),
   listAgents: vi.fn(),
   listReferences: vi.fn(),
   search: vi.fn(),
@@ -47,6 +48,13 @@ vi.mock('../api/client', async (importOriginal) => ({
   rawRecordDiagnosticEvent: vi.fn().mockResolvedValue(undefined),
 }))
 
+vi.mock('@/api/promptHistory', () => ({
+  promptHistoryApi: {
+    list: vi.fn(async () => ({ entries: [] })),
+    append: vi.fn(async () => ({ ok: true })),
+  },
+}))
+
 vi.mock('../api/sessions', () => ({
   sessionsApi: {
     create: mocks.createSession,
@@ -78,6 +86,7 @@ vi.mock('@/features/voiceInput/recorder', async (importOriginal) => ({
 vi.mock('../api/skills', () => ({
   skillsApi: {
     list: mocks.listSkills,
+    commands: mocks.listSkillCommands,
   },
 }))
 
@@ -196,6 +205,7 @@ vi.mock('../components/controls/ModelSelector', async () => {
 })
 
 import { EmptySession } from './EmptySession'
+import { clearComposerPromptHistoryCacheForTesting } from '@/hooks/useComposerPromptHistory'
 import { ApiError } from '../api/client'
 import { useChatStore } from '../stores/chatStore'
 import { useProviderStore } from '../stores/providerStore'
@@ -296,6 +306,7 @@ describe('EmptySession', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    clearComposerPromptHistoryCacheForTesting()
     // ProseMirror selection scrolling needs geometry APIs absent in jsdom.
     Object.defineProperties(Range.prototype, {
       getClientRects: { configurable: true, value: () => [] },
@@ -338,6 +349,22 @@ describe('EmptySession', () => {
     mocks.getMessages.mockResolvedValue({ messages: [] })
     mocks.getSlashCommands.mockResolvedValue({ commands: [] })
     mocks.listSkills.mockResolvedValue({ skills: [] })
+    mocks.listSkillCommands.mockImplementation(async (cwd?: string) => {
+      const { skills } = await mocks.listSkills(cwd)
+      return {
+        commands: (skills ?? [])
+          .filter((skill: { userInvocable?: boolean }) => skill.userInvocable !== false)
+          .map((skill: { name: string; description: string; source?: string; leanCompatible?: boolean }) => ({
+            name: skill.name,
+            description: skill.description,
+            kind: 'skill' as const,
+            ...(skill.source === 'user' || skill.source === 'project' || skill.source === 'plugin'
+              ? { source: skill.source }
+              : {}),
+            ...(skill.leanCompatible === false ? { leanCompatible: false } : {}),
+          })),
+      }
+    })
     mocks.listAgents.mockResolvedValue({ activeAgents: [], allAgents: [] })
     mocks.listReferences.mockResolvedValue({ plugins: [], skills: [] })
     mocks.search.mockResolvedValue({
@@ -456,7 +483,7 @@ describe('EmptySession', () => {
     expect(screen.getByTestId('model-selector')).toHaveAttribute('data-compact', 'true')
     expect(screen.getByRole('button', { name: 'Run' })).toHaveClass('h-11', 'w-11')
     expect(screen.getByTestId('empty-session-composer-shell')).toHaveClass('px-3')
-    expect(screen.getByTestId('empty-session-composer-panel')).toHaveClass('rounded-[var(--radius-xl)]')
+    expect(screen.getByTestId('empty-session-composer-panel')).toHaveClass('composer-glass', 'rounded-[var(--radius-2xl)]')
   })
 
   it.each(['@', '/', '/empty', '+'] as const)('hides withdrawn bundled capabilities in %s while keeping personal skills and other plugins', async (entry) => {
@@ -755,6 +782,127 @@ describe('EmptySession', () => {
     expect(getComposerText()).toBe('/agent debugger ')
   })
 
+  it('lists plugin manifest slash commands on /nk before the first message and inserts /plugin:cmd instead of @ mention', async () => {
+    mocks.listSkillCommands.mockResolvedValueOnce({
+      commands: [
+        {
+          name: 'nexuskit:nk-build',
+          description: 'Build NexusKit target',
+          argumentHint: '<target>',
+          kind: 'command',
+          source: 'plugin',
+        },
+        {
+          name: 'idea-refine',
+          description: 'Refine ideas with nk workflow notes',
+          kind: 'skill',
+          source: 'user',
+        },
+      ],
+    })
+    mocks.listReferences.mockResolvedValue({
+      plugins: [
+        {
+          kind: 'plugin',
+          id: 'nexuskit@nexuskit-skills',
+          name: 'nexuskit',
+          displayName: 'nexuskit',
+          description: 'NexusKit plugin',
+          source: 'nexuskit@nexuskit-skills',
+          modelText: 'Use nexuskit plugin.',
+        },
+      ],
+      skills: [
+        {
+          kind: 'skill',
+          id: 'idea-refine',
+          name: 'idea-refine',
+          displayName: 'idea-refine',
+          description: 'Refine ideas with nk workflow notes',
+          source: 'user',
+          modelText: 'Use idea-refine.',
+        },
+      ],
+    })
+
+    render(<EmptySession />)
+
+    await waitFor(() => {
+      expect(mocks.listSkillCommands).toHaveBeenCalledWith(undefined)
+    })
+
+    setComposerText('/nk', 3)
+
+    const buildOption = await screen.findByRole('option', { name: '/nexuskit:nk-build' })
+    expect(buildOption).toBeInTheDocument()
+    // Name-part match on nk-build outranks unrelated description-only skill matches.
+    expect(screen.queryByRole('option', { name: 'idea-refine' })).not.toBeInTheDocument()
+
+    fireEvent.click(buildOption)
+
+    await waitFor(() => {
+      expect(getComposerText()).toBe('/nexuskit:nk-build ')
+    })
+    expect(document.querySelector('.composer-mention')).not.toBeInTheDocument()
+    expect(mocks.createSession).not.toHaveBeenCalled()
+    expect(mocks.wsSend).not.toHaveBeenCalled()
+  })
+
+  it('does not crash when skillsApi.commands returns non-string argumentHint payloads', async () => {
+    mocks.listSkillCommands.mockResolvedValueOnce({
+      commands: [
+        {
+          name: 'nexuskit:nk-port',
+          description: 'Configure port',
+          argumentHint: 8080 as unknown as string,
+          kind: 'command',
+          source: 'plugin',
+        },
+        {
+          name: 'nexuskit:nk-flag',
+          description: 'Toggle flag',
+          argumentHint: ['--force'] as unknown as string,
+          kind: 'command',
+          source: 'plugin',
+        },
+      ],
+    })
+
+    render(<EmptySession />)
+
+    await waitFor(() => {
+      expect(mocks.listSkillCommands).toHaveBeenCalledWith(undefined)
+    })
+
+    setComposerText('/nk', 3)
+
+    expect(await screen.findByRole('option', { name: '/nexuskit:nk-port' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: '/nexuskit:nk-flag' })).toBeInTheDocument()
+  })
+
+  it('falls back to skillsApi.list when draft command discovery returns 400 for a missing workDir', async () => {
+    mocks.listSkillCommands.mockRejectedValueOnce(new ApiError(400, 'cwd must be an existing directory'))
+    mocks.listSkills.mockResolvedValueOnce({
+      skills: [
+        {
+          name: 'fallback-user-skill',
+          description: 'Available even when draft cwd is missing',
+          source: 'user',
+          userInvocable: true,
+        },
+      ],
+    })
+
+    render(<EmptySession initialWorkDir="/missing/project" />)
+
+    await waitFor(() => {
+      expect(mocks.listSkillCommands).toHaveBeenCalledWith('/missing/project')
+    })
+
+    setComposerText('/fallback', 9)
+    expect(await screen.findByText('fallback-user-skill')).toBeInTheDocument()
+  })
+
   it('opens the draft model selector for /model without creating or sending a session', async () => {
     useSettingsStore.setState({
       chatSendBehavior: 'enter',
@@ -835,29 +983,25 @@ describe('EmptySession', () => {
     expect(mocks.wsSend).not.toHaveBeenCalled()
   })
 
-  // The launch controls used to be a bar welded under the composer, which is
-  // what forced the panel's squared bottom edge and the third divider line.
-  // They are one pill in the toolbar now, so the panel is fully rounded and
-  // the row the pill sits in is the same one holding "+" and the model.
-  it('puts the run-location pill in the composer toolbar, not on a bar of its own', async () => {
+  // The floating frosted-glass composer stays uncluttered: repository launch
+  // controls tuck cleanly underneath in a bare `.surface-glass` seam strip.
+  it('renders the floating frosted-glass composer with a bare under-card context strip', async () => {
     render(<EmptySession />)
 
     const panel = screen.getByTestId('empty-session-composer-panel')
-    // 16px corner and the composer shadow step — the same floating card as
-    // ChatInput's. The repository controls live inside this panel, so it
-    // must stay a single rounded block rather than a split top/bottom pair.
-    expect(panel).toHaveClass('rounded-[var(--radius-xl)]', 'p-2', 'glass-panel--composer')
+    expect(panel).toHaveClass('composer-glass', 'rounded-[var(--radius-2xl)]', 'p-2')
     expect(panel).not.toHaveClass('rounded-b-none')
+    expect(screen.getByTestId('empty-session-hero')).toBeInTheDocument()
 
     await pickProject()
 
+    const strip = screen.getByTestId('composer-context-strip')
+    expect(strip).toHaveClass('pt-2', 'overflow-x-clip')
+    expect(strip).not.toHaveClass('composer-seam-below', '-mt-4')
     const pill = await screen.findByRole('button', { name: 'Location: project / main' })
-    expect(panel).toContainElement(pill)
+    expect(strip).toContainElement(pill)
+    expect(panel).not.toContainElement(pill)
     expect(pill).toHaveClass('h-7')
-
-    // Same toolbar row as Run — that row is the whole point of the change.
-    const toolbarRow = pill.closest('.justify-between')
-    expect(toolbarRow).toContainElement(screen.getByRole('button', { name: /Run/i }))
   })
 
   it('creates a session with the selected project and branch when submitted', async () => {
@@ -1898,8 +2042,8 @@ describe('EmptySession', () => {
     const leading = screen.getByTestId('empty-session-toolbar-leading')
     const trailing = screen.getByTestId('empty-session-toolbar-trailing')
     expect(toolbar).not.toHaveClass('flex-wrap')
-    expect(leading).toHaveClass('min-w-0', 'shrink')
-    expect(trailing).toHaveClass('shrink-0')
+    expect(leading).toHaveClass('shrink-0')
+    expect(trailing).toHaveClass('min-w-0', 'flex-1')
     expect(trailing).not.toHaveClass('min-w-max')
     // The permission glyph leads the trailing group; the usage ring is not on a draft.
     expect(trailing.firstElementChild).toContainElement(screen.getByRole('button', { name: /^Permission mode/ }))

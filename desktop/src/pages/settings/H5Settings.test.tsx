@@ -133,13 +133,16 @@ it('activates and deletes providers through the existing API without connection 
   await waitFor(() => expect(remove).toHaveBeenCalledWith('fixture-provider'))
   expect(probe).not.toHaveBeenCalled()
 })
-it('changes browser appearance without writing connected computer settings', async () => {
+it.each(['dark', 'white'] as const)('changes browser appearance to %s without writing connected computer settings', async (theme) => {
   useUIStore.setState({ activeSettingsTab: 'general', followSystemTheme: true })
   const update = vi.spyOn(settingsApi, 'updateUser')
   render(<H5Settings />)
-  fireEvent.change(screen.getByLabelText('Appearance'), { target: { value: 'ink-blue' } })
-  expect(useUIStore.getState().theme).toBe('ink-blue')
+  expect(screen.getByRole('option', { name: theme === 'dark' ? 'Dark' : 'Light' })).toHaveValue(theme)
+  fireEvent.change(screen.getByLabelText('Appearance'), { target: { value: theme } })
+  expect(useUIStore.getState().theme).toBe(theme)
   expect(useUIStore.getState().followSystemTheme).toBe(false)
+  expect(window.localStorage.getItem('cc-haha-theme')).toBe(theme)
+  expect(document.documentElement.style.colorScheme).toBe(theme === 'dark' ? 'dark' : 'light')
   expect(update).not.toHaveBeenCalled()
 })
 
@@ -159,4 +162,22 @@ it.each([true, false])('shows beta details on focus without overflowing narrow f
   const description = await screen.findByRole('tooltip')
   expect(description).toHaveTextContent('CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1')
   expect(description.classList.contains('[overflow-wrap:anywhere]')).toBe(true)
+})
+
+it('renders a clean desktop page header and autohide scroller without modal-close padding workarounds', () => {
+  render(<H5Settings />)
+  const header = screen.getByTestId('h5-settings-desktop-header')
+  expect(header).toHaveTextContent('Settings')
+  expect(header.className).toContain('md:flex')
+  expect(header.className).not.toContain('pr-10')
+  expect(screen.getByTestId('h5-settings-scroll').className).toContain('scrollbar-autohide')
+})
+
+it('keeps H5Settings and its subpages on opaque paper surfaces', async () => {
+  render(<H5Settings />)
+  expect(screen.getByTestId('h5-settings-scroll')).toHaveClass('bg-[var(--color-surface)]')
+  expect(screen.getByTestId('h5-settings-scroll')).not.toHaveClass('bg-transparent')
+  fireEvent.click(screen.getByTestId('h5-settings-providers'))
+  expect(await screen.findByTestId('h5-settings-subpage')).toHaveClass('bg-[var(--color-surface)]')
+  expect(screen.getByTestId('h5-settings-subpage')).not.toHaveClass('bg-transparent')
 })

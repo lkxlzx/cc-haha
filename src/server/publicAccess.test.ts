@@ -159,6 +159,20 @@ describe('public transport boundary', () => {
     expect(response.status).toBe(503)
     expect(await response.json()).toEqual({ error: 'Network proxy unavailable', code: 'proxy' })
   })
+
+  test('correlates authenticated connection checks with the host attempt and ignores arbitrary header text', async () => {
+    const calls: unknown[] = []
+    const f = fixture(undefined, 'https://fixture.trycloudflare.com', {
+      resolveProxy: async context => { calls.push(['network', context]); return { proxyUrl: null } },
+      verifyGateway: async (_origin, _gateway, context) => { calls.push(['verify', context]); return true },
+    })
+    const attemptId = '81d5559c-a61e-4871-a185-4e7aaf02c693'
+    for (const [route, method, attempt] of [['network', 'GET', attemptId], ['verify', 'POST', attemptId], ['network', 'GET', 'not-a-valid-id;password=private-secret']]) {
+      const response = await f.service.control(new Request(`http://localhost/api/public-access/${route}`, { method, headers: { Authorization: 'Bearer fixture-process-credential', 'X-CC-Haha-Connection-Attempt': attempt } }))
+      expect(response.ok).toBe(true)
+    }
+    expect(calls).toEqual([['network', { attemptId }], ['verify', { attemptId }], ['network', {}]])
+  })
   test('custom tunnels use the requested fixed port across restarts without changing device credentials', async () => {
     const f = fixture()
     const { claim } = await f.pairNative()
@@ -557,6 +571,33 @@ test('push route allowlist refuses extra segments and unsupported methods', () =
   expect(allowed('/api/sessions/mobile-push/pull/extra', 'POST')).toBe(false)
   expect(allowed('/api/sessions/mobile-push/id', 'POST')).toBe(false)
   expect(allowed('/api/sessions/mobile-push/test/extra', 'POST')).toBe(false)
+})
+
+test('mobile-update allowlist permits only read-only Android update routes with validated params', () => {
+  const allowed = (path: string, method: string) => isPublicBusinessPathAllowed(new URL(path, 'https://fixture.test'), method)
+  const sha = 'a'.repeat(64)
+  expect(allowed('/api/mobile-update/android/latest', 'GET')).toBe(true)
+  expect(allowed('/api/mobile-update/android/latest?refresh=1', 'GET')).toBe(true)
+  expect(allowed('/api/mobile-update/android/latest?refresh=2', 'GET')).toBe(false)
+  expect(allowed('/api/mobile-update/android/latest?refresh=1&refresh=1', 'GET')).toBe(false)
+  expect(allowed('/api/mobile-update/android/latest?url=https://evil.test', 'GET')).toBe(false)
+  expect(allowed('/api/mobile-update/android/latest', 'POST')).toBe(false)
+  expect(allowed('/api/mobile-update/android/latest/', 'GET')).toBe(false)
+  expect(allowed('/api//mobile-update/android/latest', 'GET')).toBe(false)
+  expect(allowed('/api/mobile-update/android/apk', 'GET')).toBe(true)
+  expect(allowed(`/api/mobile-update/android/apk?sha256=${sha}`, 'GET')).toBe(true)
+  expect(allowed('/api/mobile-update/android/apk?sha256=not-hex', 'GET')).toBe(false)
+  expect(allowed(`/api/mobile-update/android/apk?sha256=${sha}&sha256=${sha}`, 'GET')).toBe(false)
+  expect(allowed('/api/mobile-update/android/apk?url=https://evil.test', 'GET')).toBe(false)
+  expect(allowed('/api/mobile-update/android/apk', 'DELETE')).toBe(false)
+  expect(allowed('/api/mobile-update/android/prepare', 'POST')).toBe(true)
+  expect(allowed('/api/mobile-update/android/prepare', 'GET')).toBe(true)
+  expect(allowed(`/api/mobile-update/android/prepare?sha256=${sha}`, 'POST')).toBe(true)
+  expect(allowed(`/api/mobile-update/android/prepare?sha256=${sha}`, 'GET')).toBe(true)
+  expect(allowed('/api/mobile-update/android/prepare?sha256=bad', 'POST')).toBe(false)
+  expect(allowed('/api/mobile-update/android/prepare', 'DELETE')).toBe(false)
+  expect(allowed('/api/mobile-update/ios/latest', 'GET')).toBe(false)
+  expect(allowed('/api/mobile-update/android/apk/extra', 'GET')).toBe(false)
 })
 
 test('paired phones can browse directories without gaining file/search/write routes', async () => {
@@ -997,6 +1038,29 @@ describe('resumable session streams through the gateway', () => {
 describe('a changed public address reaches paired phones', () => {
   const sha256 = (value: string) => createHash('sha256').update(value).digest('hex')
   const macFor = (token: string, message: string) => createHmac('sha256', sha256(token)).update(message).digest('base64url')
+  function lanFixture(connectivity: Parameters<typeof fixture>[2] = {}, rejectLanBind = false) {
+    const serve = Bun.serve
+    const requested: Array<{ hostname: unknown, port: unknown }> = []
+    let lanPort: number | null = null
+    const bind = spyOn(Bun, 'serve').mockImplementation(((options: Parameters<typeof Bun.serve>[0]) => {
+      if (options.hostname !== '0.0.0.0') return serve(options)
+      requested.push({ hostname: options.hostname, port: options.port })
+      if (rejectLanBind) throw Object.assign(new Error('Fixture LAN bind unavailable'), { code: 'EADDRINUSE' })
+      // Hold an atomically allocated real listener, not the unreserved next port.
+      const listener = serve({ ...options, port: 0 })
+      lanPort = listener.port ?? null
+      return listener
+    }) as typeof Bun.serve)
+    try {
+      const remote = fixture(undefined, undefined, connectivity)
+      expect(requested).toEqual([{ hostname: '0.0.0.0', port: remote.service.status().port! + 1 }])
+      if (rejectLanBind) expect(lanPort).toBeNull()
+      else expect(lanPort).toBeNumber()
+      return { ...remote, lanPort }
+    } finally {
+      bind.mockRestore()
+    }
+  }
   /** A non-loopback address of this machine: requests to it arrive like a phone's on the LAN. */
   const lanAddress = Object.values(os.networkInterfaces()).flat().find(entry => entry?.family === 'IPv4' && !entry.internal)?.address
   const bareServer = (storePath: string, onOriginChanged: ConstructorParameters<typeof PublicAccessServer>[0]['onOriginChanged']) => new PublicAccessServer({
@@ -1006,7 +1070,7 @@ describe('a changed public address reaches paired phones', () => {
   })
 
   test('a paired phone learns where to find the gateway on its local network', async () => {
-    const remote = fixture(undefined, undefined, {
+    const remote = lanFixture({
       networkInterfaces: () => ({
         lo0: [{ address: '127.0.0.1', family: 'IPv4', internal: true } as os.NetworkInterfaceInfo],
         en0: [
@@ -1020,14 +1084,32 @@ describe('a changed public address reaches paired phones', () => {
     const { claim } = await remote.pairNative()
     const response = await remote.native('/api/public-access/locator', claim.token)
     expect(response.status).toBe(200)
-    expect(await response.json()).toEqual({ port: remote.service.status().port! + 1, addresses: ['192.168.1.5', '100.101.1.2'] })
+    expect(await response.json()).toEqual({ port: remote.lanPort, addresses: ['192.168.1.5', '100.101.1.2'] })
     expect((await remote.remote('/api/public-access/locator')).status).toBe(401)
   })
 
-  test.skipIf(!lanAddress)('from the LAN only the signed address lookup answers, never the gateway', async () => {
-    const remote = fixture()
+  test('an unavailable LAN locator leaves the authenticated loopback gateway usable', async () => {
+    const remote = lanFixture({}, true)
+    expect(remote.service.status()).toMatchObject({ enabled: true, port: expect.any(Number) })
+    expect((await remote.remote('/health')).status).toBe(200)
     const { claim } = await remote.pairNative()
-    const lan = `http://${lanAddress}:${remote.service.status().port! + 1}`
+    const locator = await remote.native('/api/public-access/locator', claim.token)
+    expect(locator.status).toBe(200)
+    expect(await locator.json()).toEqual({ port: null, addresses: [] })
+    expect((await remote.remote('/api/public-access/locator')).status).toBe(401)
+    expect((await remote.native('/api/public-access/session', claim.token)).status).toBe(200)
+    remote.service.disable()
+    await expect(fetch(`${remote.base}/health`)).rejects.toThrow()
+  })
+
+  test.skipIf(!lanAddress)('from the LAN only the signed address lookup answers, never the gateway', async () => {
+    const remote = lanFixture()
+    const { claim } = await remote.pairNative()
+    const locator = await remote.native('/api/public-access/locator', claim.token)
+    expect(locator.status).toBe(200)
+    const endpoint = await locator.json() as { port: number | null }
+    expect(endpoint.port).toBe(remote.lanPort)
+    const lan = `http://${lanAddress}:${endpoint.port}`
     const nonce = 'n'.repeat(22)
     const id = sha256(sha256(claim.token))
     const located = await fetch(`${lan}/api/public-access/locate?id=${id}&nonce=${nonce}`)
